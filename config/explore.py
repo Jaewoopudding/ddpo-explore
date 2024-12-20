@@ -111,8 +111,8 @@ def get_config():
     # contains fewer than `min_count` values, the mean and std of the entire batch will be used instead.
     config.per_prompt_stat_tracking.min_count = 16
 
-    
-    explore.beta = 0.01
+    config.explore = explore = ml_collections.ConfigDict()
+    explore.beta = 1.0
     explore.decay = 0.1
 
     return config

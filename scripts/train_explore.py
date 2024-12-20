@@ -25,11 +25,12 @@ import tqdm
 import tempfile
 from PIL import Image
 
+
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 
 FLAGS = flags.FLAGS
-config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
+config_flags.DEFINE_config_file("config", "config/explore.py", "Training configuration.")
 
 logger = get_logger(__name__)
 
@@ -81,7 +82,7 @@ def main(_):
         accelerator.init_trackers(
             project_name="Explorative-Diffusion-Finetuning",
             config=config.to_dict(),
-            init_kwargs={"wandb": {"name": config.reward_fn + f"_{config.train.gradient_accumulation_steps * accelerator.state.num_processes}_original",
+            init_kwargs={"wandb": {"name": config.reward_fn + f"_{config.train.gradient_accumulation_steps * accelerator.state.num_processes}_explore_v1",
                                    "group": config.prompt_fn}},
         )
     logger.info(f"\n{config}")
@@ -498,7 +499,11 @@ def main(_):
                     )
                 else:
                     embeds = sample["prompt_embeds"]
-
+                    
+                    
+                accumulated_log_prob = 0 
+                
+                
                 for j in tqdm(
                     range(num_train_timesteps),
                     desc="Timestep",
@@ -508,6 +513,7 @@ def main(_):
                 ):
                     with accelerator.accumulate(unet):
                         with autocast():
+                            
                             if config.train.cfg:
                                 noise_pred = unet(
                                     torch.cat([sample["latents"][:, j]] * 2),
@@ -535,6 +541,15 @@ def main(_):
                                 eta=config.sample.eta,
                                 prev_sample=sample["next_latents"][:, j],
                             )
+                        
+                        
+                        ####### EXPLORATION VIA DENSITY #########
+                        accumulated_log_prob += log_prob
+                        accumulated_old_log_prob = sample["log_probs"][:, :j+1].sum(1)
+                        explore_sum_ratio = torch.exp(accumulated_log_prob - accumulated_old_log_prob)
+                        exponentiated_ratio = torch.pow(explore_sum_ratio, config.explore.decay / np.sqrt((float(global_step) + 1.0) * total_train_batch_size))
+                        intrinsic_reward = config.explore.beta * (torch.sqrt(torch.clamp(exponentiated_ratio, min=1.0) - 1))
+                        accelerator.backward(-intrinsic_reward, retain_graph=True)
 
                         # ppo logic
                         advantages = torch.clamp(
@@ -549,7 +564,9 @@ def main(_):
                             1.0 - config.train.clip_range,
                             1.0 + config.train.clip_range,
                         )
-                        loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+                        loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) 
+                        
+                        
 
                         # debugging values
                         # John Schulman says that (ratio - 1) - log(ratio) is a better
@@ -566,13 +583,9 @@ def main(_):
                                 ).float()
                             )
                         )
-                        
-                        # try:
-                        #     assert ratio.detach().cpu().numpy() == 1.0
-                        # except:
-                        #     print(ratio)
-                        #     breakpoint()
+
                         info["loss"].append(loss)
+                        info["intrinsic reward"].append(intrinsic_reward)
 
                         # backward pass
                         accelerator.backward(loss)
