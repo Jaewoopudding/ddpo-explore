@@ -19,7 +19,7 @@ def get_config():
     # number of checkpoints to keep before overwriting old ones.
     config.num_checkpoint_limit = 5
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
-    config.mixed_precision = "fp16"
+    config.mixed_precision = "no"
     # allow tf32 on Ampere GPUs, which can speed up training.
     config.allow_tf32 = True
     # resume training from a checkpoint. either an exact checkpoint directory (e.g. checkpoint_50), or a directory
@@ -53,7 +53,7 @@ def get_config():
     # number of batches to sample per epoch. the total number of samples per epoch is `num_batches_per_epoch *
     # batch_size * num_gpus`.
     # 
-    sample.num_batches_per_epoch = 8
+    sample.num_batches_per_epoch = 2
 
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
@@ -73,7 +73,7 @@ def get_config():
     train.adam_epsilon = 1e-8
     # number of gradient accumulation steps. the effective batch size is `batch_size * num_gpus *
     # gradient_accumulation_steps`.
-    train.gradient_accumulation_steps = 8
+    train.gradient_accumulation_steps = 2
     # maximum gradient norm for gradient clipping.
     train.max_grad_norm = 1.0
     # number of inner epochs per outer epoch. each inner epoch is one iteration through the data collected during one
