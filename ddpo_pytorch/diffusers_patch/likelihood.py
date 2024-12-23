@@ -184,13 +184,33 @@ def ode_likelihood(
             # latent_model_input = latent_model_input.float().requires_grad_(True) # for differentiation
             # prompt_embeds = prompt_embeds.float().requires_grad_(True)
             latent_model_input = latent_model_input.requires_grad_(True)
-            noise_pred = self.pipeline.unet(
-                    latent_model_input,
-                    timesteps, ## TODO
-                    encoder_hidden_states=prompt_embeds,
-                    cross_attention_kwargs=None,
-                    return_dict=False,
-            )[0]
+            timesteps = timesteps.requires_grad_(True)
+
+            # def hook_fn(module, input, output):
+            #     print(f"Module: {module.__class__.__name__}")
+            #     if isinstance(output, (tuple, list)): 
+            #         for i, out in enumerate(output):
+            #             print(f"  Output[{i}] grad_fn: {getattr(out, 'grad_fn', None)}")
+            #             print(f"  Output[{i}] requires_grad: {getattr(out, 'requires_grad', 'N/A')}")
+            #     else:  
+            #         print(f"  Output grad_fn: {output.grad_fn}")
+            #         print(f"  Output requires_grad: {output.requires_grad}")
+            #     print("-" * 40)
+            
+            # for name, module in self.pipeline.unet.named_modules():
+            #     if name: 
+            #         module.register_forward_hook(hook_fn)
+            
+            betas = self.pipeline.scheduler.betas.to(self.device)
+            # # breakpoint()
+            with torch.enable_grad():
+                noise_pred = self.pipeline.unet(
+                        latent_model_input,
+                        timesteps, ## TODO
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=None,
+                        return_dict=False,
+                )[0]
             # self.pipeline.unet(latent_model_input, timesteps, encoder_hidden_states=prompt_embeds, cross_attention_kwargs=None, return_dict=False)
             # if do_classifier_free_guidance:
             #     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -203,26 +223,26 @@ def ode_likelihood(
             #     noise_pred = rescale_noise_cfg(
             #         noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
             #     )
-            
-            score = - noise_pred
-            betas = self.pipeline.scheduler.betas.to(self.device)
-            beta_t = betas.gather(0, timesteps.to(torch.int64))
-            drift = -0.5 * beta_t * latent_model_input - 0.5 * beta_t * score
-            
-            print("#"*50)
-            print(f"latent_model_input: {latent_model_input.dtype}, {latent_model_input.requires_grad}")
-            print(f"timesteps: {timesteps.dtype}, {timesteps.requires_grad}")
-            print(f"prompt_embeds: {prompt_embeds.dtype}, {prompt_embeds.requires_grad}")
-            print(f"drift: {drift.grad_fn}")
-            print("#"*50)
-            
-            breakpoint()
-            score_divergence_estimation = torch.sum(
-                torch.autograd.grad(
-                    torch.sum(score * epsilon), latent_model_input
-                )[0] * epsilon, dim=(1,2,3)
-            )
-            
+                score = - noise_pred
+                weighted_score = score * epsilon.clone()
+                # print("score ", score.requires_grad)
+
+                beta_t = betas.clone().gather(0, timesteps.to(torch.int64))
+                drift = -0.5 * beta_t * latent_model_input - 0.5 * beta_t * score
+                
+                print("#"*50)
+                print(f"latent_model_input: {latent_model_input.dtype}, {latent_model_input.requires_grad}")
+                print(f"timesteps: {timesteps.dtype}, {timesteps.requires_grad}")
+                print(f"prompt_embeds: {prompt_embeds.dtype}, {prompt_embeds.requires_grad}")
+                print(f"drift: {drift.grad_fn}")
+                print("#"*50)
+                
+                score_divergence_estimation = torch.sum(
+                    torch.autograd.grad(
+                        torch.sum(weighted_score), latent_model_input
+                    )[0] * epsilon, dim=(1,2,3)
+                )
+                
             
             # score_divergence_estimation = torch.sum(torch.autograd.grad(torch.sum(score * epsilon), latent_model_input)[0] * epsilon, dim=(1,2,3))
             
@@ -232,20 +252,22 @@ def ode_likelihood(
         def forward(self, t, x):
             self.nfe = self.nfe + 1
             epsilon = torch.randn_like(x[0])
+            breakpoint()
             drift, divergence = self.estimate_score_and_divergence(t, x, epsilon)
             return drift, torch.zeros_like(x[1]), divergence # latent, prompt, log_p
     
     # Skilling-Hutchinson's divergence estimator
     
+
     log_p = torch.zeros(shape[0]).to(device)
-    timesteps = pipeline.scheduler.timesteps.to(device).float() ## TODO: precision 16, 32
+    timesteps = pipeline.scheduler.timesteps.to(device).to(torch.float32).requires_grad_() ## TODO: precision 16, 32
     ode_func = ODEFunc(pipeline, device)
     
     # 왜인지 여기 debug에서는 되는데 odeint속으로 들어가면 float16, 32라던지, 안 맞는 것들이 생긴다. 
     inputs = (encoded_latents, prompt_embeds, log_p) # for debug
     ode_func(timesteps[0], inputs) # for debug
     
-    
+    print("odeint start")
     result = odeint(
         ode_func, 
         (encoded_latents, prompt_embeds, log_p), 
