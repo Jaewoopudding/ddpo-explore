@@ -456,8 +456,8 @@ def main(_):
         assert num_timesteps == config.sample.num_steps
         sample_data = samples['latents'][0, :]
         sample_embed_prompts = samples['prompt_embeds'][:2, :, :]
-        ode_likelihood(pipeline, images.repeat(2, 1, 1, 1), prompt_embeds=samples['prompt_embeds'][:2, :, :])
-
+        result = ode_likelihood(pipeline, images.repeat(2, 1, 1, 1), prompt_embeds=samples['prompt_embeds'][:2, :, :])
+        breakpoint()
         # #################### TRAINING ####################
         # for inner_epoch in range(config.train.num_inner_epochs):
         #     # shuffle samples along batch dimension

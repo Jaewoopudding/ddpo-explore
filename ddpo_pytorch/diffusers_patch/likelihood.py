@@ -28,9 +28,9 @@ def prior_likelihood(
 #         gradient_score_estimation = torch.autograd.grad(score_estimation, sample)[0] 
 #     return torch.sum(gradient_score_estimation * epsilon, dim=(1,2,3))
 
-class DiffusionProbabilisticODE(StableDiffusionPipeline):
-    def forward(self, t, x):
-        return super().forward(x)
+# class DiffusionProbabilisticODE(StableDiffusionPipeline):
+#     def forward(self, t, x):
+#         return super().forward(x)
     
 def ode_likelihood(
     pipeline,
@@ -55,17 +55,6 @@ def ode_likelihood(
     cross_attention_kwargs: Optional[Dict[str, Any]] = None,
     guidance_rescale: float = 0.0,
 ):
-    """Compute the log likelihood of the given sample with probability flow ODE
-
-    Args:
-        x (_type_): _description_
-        score_model (_type_): _description_
-        marginal_prob_std (_type_): _description_
-        diffusion_coeff (_type_): _description_
-        batch_size (_type_): _description_
-        device (_type_): _description_
-        eps (_type_): _description_
-    """
     shape = x.shape
     
     # step 0
@@ -123,119 +112,42 @@ def ode_likelihood(
             x, return_dict=False
     )[0].sample() ###TODO we have to encode the given image and feed it to the pipeline
     
-    # def estimate_score_and_divergence(timesteps, inputs, epsilon):
-    #     latent_model_input, prompt_embeds = inputs 
-    #     latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, timesteps)
-    #     latent_model_input.requires_grad(True) # for differentiation
-    #     noise_pred = pipeline.unet(
-    #             latent_model_input,
-    #             timesteps,
-    #             encoder_hidden_states=prompt_embeds,
-    #             cross_attention_kwargs=cross_attention_kwargs,
-    #             return_dict=False,
-    #     )[0].sample()
-        
-        # if do_classifier_free_guidance:
-        #     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        #     noise_pred = noise_pred_uncond + guidance_scale * (
-        #         noise_pred_text - noise_pred_uncond
-        #     )
-        
-        # if do_classifier_free_guidance and guidance_rescale > 0.0:
-        #     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-        #     noise_pred = rescale_noise_cfg(
-        #         noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
-        #     )
-            
-        # score = - noise_pred
-        # beta_t = pipeline.scheduler.betas.gather(0, timesteps)
-        # drift = -0.5 * beta_t * latent_model_input - 0.5 * beta_t * score
-        # score_divergence_estimation = torch.sum(
-        #     torch.autograd.grad(score, latent_model_input)[0] * epsilon, dim=(1,2,3)
-        # )
-        # return drift, score_divergence_estimation # for returning drift and score function
-    
-
-    # def ode_func(t, x):
-    #     """_summary_
-
-    #     Args:
-    #         t (_type_): _description_
-    #         x (_type_): It should be a list of latent_model_input, t, prompt_embeds, cross_attention_kwargs
-
-    #     Returns:
-    #         _type_: _description_
-    #     """
-    #     epsilon = torch.randn_like(x[0]) # input latent dimension
-    #     drift, divergence = estimate_score_and_divergence(t, x, epsilon)
-    #     return drift, divergence
-    
     class ODEFunc(nn.Module):
-        def __init__(self, pipeline, device):
+        def __init__(self, pipeline, prompt_embeds, device):
             super().__init__()
             self.pipeline = pipeline
+            self.prompt_embeds = prompt_embeds
             self.nfe = 0
             self.device = device
             
         def estimate_score_and_divergence(self, timesteps, inputs, epsilon):
-            latent_model_input, prompt_embeds, _ = inputs
-            latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, timesteps)
-            # timesteps = timesteps.float().requires_grad_(True) ##TODO 제거가능한지 살펴보기
-            # latent_model_input = latent_model_input.float().requires_grad_(True) # for differentiation
-            # prompt_embeds = prompt_embeds.float().requires_grad_(True)
-            latent_model_input = latent_model_input.requires_grad_(True)
+            latent_model_input, log_p = inputs 
+            latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, timesteps) ## TODO  이부분 timestep이 아니라 sigma 접근 필요함
+            latent_model_input = latent_model_input.requires_grad_(True) # 그리고 인풋을 sigma로 나누는? 상황을 연출하는데 왜그런지는 모르겠음
+            # https://github.com/Mattias421/clevr_diff/blob/main/sdxl_turbo_ll.py#L64
             timesteps = timesteps.requires_grad_(True)
-
-            # def hook_fn(module, input, output):
-            #     print(f"Module: {module.__class__.__name__}")
-            #     if isinstance(output, (tuple, list)): 
-            #         for i, out in enumerate(output):
-            #             print(f"  Output[{i}] grad_fn: {getattr(out, 'grad_fn', None)}")
-            #             print(f"  Output[{i}] requires_grad: {getattr(out, 'requires_grad', 'N/A')}")
-            #     else:  
-            #         print(f"  Output grad_fn: {output.grad_fn}")
-            #         print(f"  Output requires_grad: {output.requires_grad}")
-            #     print("-" * 40)
-            
-            # for name, module in self.pipeline.unet.named_modules():
-            #     if name: 
-            #         module.register_forward_hook(hook_fn)
-            
+            print(log_p / 3 / 512 / 512 / torch.log(torch.tensor([2])).to(self.device))
             betas = self.pipeline.scheduler.betas.to(self.device)
             # # breakpoint()
             with torch.enable_grad():
                 noise_pred = self.pipeline.unet(
                         latent_model_input,
                         timesteps, ## TODO
-                        encoder_hidden_states=prompt_embeds,
+                        encoder_hidden_states=self.prompt_embeds,
                         cross_attention_kwargs=None,
                         return_dict=False,
                 )[0]
-            # self.pipeline.unet(latent_model_input, timesteps, encoder_hidden_states=prompt_embeds, cross_attention_kwargs=None, return_dict=False)
-            # if do_classifier_free_guidance:
-            #     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            #     noise_pred = noise_pred_uncond + guidance_scale * (
-            #         noise_pred_text - noise_pred_uncond
-            #     )
-            
-            # if do_classifier_free_guidance and guidance_rescale > 0.0:
-            #     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-            #     noise_pred = rescale_noise_cfg(
-            #         noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
-            #     )
                 score = - noise_pred
                 weighted_score = score * epsilon.clone()
-                # print("score ", score.requires_grad)
-
                 beta_t = betas.clone().gather(0, timesteps.to(torch.int64))
                 drift = -0.5 * beta_t * latent_model_input - 0.5 * beta_t * score
                 
-                print("#"*50)
-                print(f"latent_model_input: {latent_model_input.dtype}, {latent_model_input.requires_grad}")
-                print(f"timesteps: {timesteps.dtype}, {timesteps.requires_grad}")
-                print(f"prompt_embeds: {prompt_embeds.dtype}, {prompt_embeds.requires_grad}")
-                print(f"drift: {drift.grad_fn}")
-                print("#"*50)
+                # print("#"*50)
+                # print(f"latent_model_input: {latent_model_input.dtype}, {latent_model_input.requires_grad}")
+                # print(f"timesteps: {timesteps.dtype}, {timesteps.requires_grad}")
+                # print(f"prompt_embeds: {prompt_embeds.dtype}, {prompt_embeds.requires_grad}")
+                # print(f"drift: {drift.grad_fn}")
+                # print("#"*50)
                 
                 score_divergence_estimation = torch.sum(
                     torch.autograd.grad(
@@ -251,37 +163,41 @@ def ode_likelihood(
             
         def forward(self, t, x):
             self.nfe = self.nfe + 1
+            print(self.nfe)
             epsilon = torch.randn_like(x[0])
-            breakpoint()
+            # breakpoint()
             drift, divergence = self.estimate_score_and_divergence(t, x, epsilon)
-            return drift, torch.zeros_like(x[1]), divergence # latent, prompt, log_p
+            return drift, divergence # latent, log_p
     
     # Skilling-Hutchinson's divergence estimator
     
 
     log_p = torch.zeros(shape[0]).to(device)
     timesteps = pipeline.scheduler.timesteps.to(device).to(torch.float32).requires_grad_() ## TODO: precision 16, 32
-    ode_func = ODEFunc(pipeline, device)
+    ode_func = ODEFunc(pipeline, prompt_embeds, device)
     
     # 왜인지 여기 debug에서는 되는데 odeint속으로 들어가면 float16, 32라던지, 안 맞는 것들이 생긴다. 
-    inputs = (encoded_latents, prompt_embeds, log_p) # for debug
+    inputs = (encoded_latents, log_p) # for debug
     ode_func(timesteps[0], inputs) # for debug
     
     print("odeint start")
     result = odeint(
         ode_func, 
-        (encoded_latents, prompt_embeds, log_p), 
+        (encoded_latents, log_p), 
         timesteps, 
-        method='dopri5'
+        method='dopri5',
+        atol=1e-1,
+        rtol=1e-1,
     )
     
     breakpoint()
     
-    # 두번째 인자로 들어가는 tuple이 지속적으로 변하는 것으로 추정된다. 
+    latent_prior, log_likelihood_integration = result[0][-1], result[1][-1]
     
-    log_likelihood = log_likelihood_integration + prior_likelihood()
+    log_likelihood = log_likelihood_integration + prior_likelihood(latent_prior, sigma=1) ##TODO find the exact sigma.
+    bpd = log_likelihood / 3 / 512 / 512 / torch.log(2) + 8.
     
-    return log_likelihood, bpd
+    return log_likelihood, bpd, ode_func.nfe
     
     # def divergence_eval(inputs, timesteps, score_model, epsilon):
     #     score = score_eval_wrapper
