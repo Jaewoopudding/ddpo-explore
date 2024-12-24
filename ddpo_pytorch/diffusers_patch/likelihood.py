@@ -3,8 +3,9 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
 from torchdiffeq import odeint_adjoint as odeint
-
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
     StableDiffusionPipeline,
     rescale_noise_cfg,
@@ -95,10 +96,20 @@ def ode_likelihood(
     # step 5 : prepare latent variables
     # step 6 : prepare extra step kwawrgs 
     extra_step_kwargs = pipeline.prepare_extra_step_kwargs(generator, eta) 
-    
+    for idx, image in enumerate(x):
+        plt.imsave(f'sample_images/{idx}_original.png', image.cpu().detach().numpy().transpose(1,2,0))
+        
+    image_processor = VaeImageProcessor(vae_scale_factor=pipeline.vae_scale_factor)
+    x = image_processor.preprocess(x, height, width)
     encoded_latents = pipeline.vae.encode( ### TODO stochasticity 제거하기
-            x, return_dict=False
-    )[0].sample() ###TODO we have to encode the given image and feed it to the pipeline
+            x
+    ).latent_dist.sample(generator) ###TODO we have to encode the given image and feed it to the pipeline
+    
+    images = image_decode(pipeline, encoded_latents)
+    for idx, image in enumerate(images):
+        plt.imsave(f'sample_images/{idx}_recon_original.png', image)
+        
+    breakpoint()
     
     class ODEFunc(nn.Module):
         def __init__(self, pipeline, prompt_embeds, device):
@@ -154,13 +165,17 @@ def ode_likelihood(
             print(self.nfe)
             epsilon = torch.randn_like(x[0])
             drift, divergence = self.estimate_score_and_divergence(t, x, epsilon)
+            images = image_decode(self.pipeline, x[0])
+            for idx, image in enumerate(images):
+                plt.imsave(f'sample_images/{idx}_{t}.png', image)
             return drift, divergence # latent, log_p
     
     # Skilling-Hutchinson's divergence estimator
     
     log_p = torch.zeros(shape[0]).to(device)
-    timesteps = pipeline.scheduler.timesteps.to(device).to(torch.float32).requires_grad_() ## TODO: precision 16, 32
-    breakpoint()
+    timesteps = pipeline.scheduler.timesteps.to(device).to(torch.float32).requires_grad_().flip(0) ## TODO: precision 16, 32
+    # breakpoint()
+    # timesteps = torch.tensor([0, pipeline.scheduler.config.num_train_timesteps-1]).to(device).to(torch.float32).requires_grad_()
     
     # 적응형 solver 쓸거면 (RK45) start값일아 end값만 넣어줘도 된다. 
     
@@ -174,9 +189,9 @@ def ode_likelihood(
         ode_func, 
         (encoded_latents, log_p), 
         timesteps, 
-        method='rk4',
-        atol=1e-2,
-        rtol=1e-2,
+        method='euler',
+        atol=1e-3,
+        rtol=1e-3,
     )
     
     latent_prior, log_likelihood_integration = result[0][-1], result[1][-1]
@@ -186,5 +201,11 @@ def ode_likelihood(
     breakpoint()
     return log_likelihood, bpd, ode_func.nfe
     
-def image_decode(pipeline, latent):
-    pass
+def image_decode(pipeline, latents):
+    image = pipeline.vae.decode(
+            latents / pipeline.vae.config.scaling_factor, return_dict=False
+    )[0].detach()
+    image = pipeline.image_processor.postprocess(
+        image, output_type='np'
+    )
+    return image
