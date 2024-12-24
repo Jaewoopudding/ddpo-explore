@@ -1,6 +1,6 @@
 from typing import Any, Callable, Dict, List, Optional, Union
 
-import numpy
+import numpy as np
 import torch
 import torch.nn as nn
 from torchdiffeq import odeint_adjoint as odeint
@@ -16,21 +16,9 @@ def prior_likelihood(
     z: torch.FloatTensor, 
     sigma: float,
 ):
-    shape = z.shape
+    shape = torch.tensor(z.shape)
     N = torch.prod(shape[1:])
-    return -N / 2. * torch.log(2*np.pi*sigma**2) - torch.sum(z**2, dim=(1,2,3)) / (2 * sigma**2)
-    
-    
-# def divergence_eval(sample, timesteps, score_model, epsilon):
-#     with torch.enable_grad():
-#         sample.requires_grad(True)
-#         score_estimation = torch.sum(score_model(sample, timesteps) * epsilon)
-#         gradient_score_estimation = torch.autograd.grad(score_estimation, sample)[0] 
-#     return torch.sum(gradient_score_estimation * epsilon, dim=(1,2,3))
-
-# class DiffusionProbabilisticODE(StableDiffusionPipeline):
-#     def forward(self, t, x):
-#         return super().forward(x)
+    return -N / 2. * np.log(2*np.pi*sigma**2) - torch.sum(z**2, dim=(1,2,3)) / (2 * sigma**2)
     
 def ode_likelihood(
     pipeline,
@@ -73,12 +61,12 @@ def ode_likelihood(
     )
     
     # step 2
-    if prompt is not None and isinstance(prompt, str):
-        batch_size = 1
-    elif prompt is not None and isinstance(prompt, list):
-        batch_size = len(prompt)
-    else:
-        batch_size = prompt_embeds.shape[0]
+    # if prompt is not None and isinstance(prompt, str):
+    #     batch_size = 1
+    # elif prompt is not None and isinstance(prompt, list):
+    #     batch_size = len(prompt)
+    # else:
+    #     batch_size = prompt_embeds.shape[0]
         
     device = pipeline._execution_device
     do_classifier_free_guidance = guidance_scale > 1.0
@@ -128,7 +116,6 @@ def ode_likelihood(
             timesteps = timesteps.requires_grad_(True)
             print(log_p / 3 / 512 / 512 / torch.log(torch.tensor([2])).to(self.device))
             betas = self.pipeline.scheduler.betas.to(self.device)
-            # # breakpoint()
             with torch.enable_grad():
                 noise_pred = self.pipeline.unet(
                         latent_model_input,
@@ -150,9 +137,9 @@ def ode_likelihood(
                 # print("#"*50)
                 
                 score_divergence_estimation = torch.sum(
-                    torch.autograd.grad(
+                    epsilon * torch.autograd.grad(
                         torch.sum(weighted_score), latent_model_input
-                    )[0] * epsilon, dim=(1,2,3)
+                    )[0], dim=(1,2,3)
                 )
                 
             
@@ -162,20 +149,22 @@ def ode_likelihood(
             return drift, score_divergence_estimation
             
         def forward(self, t, x):
+            print("timestep:", t)
             self.nfe = self.nfe + 1
             print(self.nfe)
             epsilon = torch.randn_like(x[0])
-            # breakpoint()
             drift, divergence = self.estimate_score_and_divergence(t, x, epsilon)
             return drift, divergence # latent, log_p
     
     # Skilling-Hutchinson's divergence estimator
     
-
     log_p = torch.zeros(shape[0]).to(device)
     timesteps = pipeline.scheduler.timesteps.to(device).to(torch.float32).requires_grad_() ## TODO: precision 16, 32
-    ode_func = ODEFunc(pipeline, prompt_embeds, device)
+    breakpoint()
     
+    # 적응형 solver 쓸거면 (RK45) start값일아 end값만 넣어줘도 된다. 
+    
+    ode_func = ODEFunc(pipeline, prompt_embeds, device)
     # 왜인지 여기 debug에서는 되는데 odeint속으로 들어가면 float16, 32라던지, 안 맞는 것들이 생긴다. 
     inputs = (encoded_latents, log_p) # for debug
     ode_func(timesteps[0], inputs) # for debug
@@ -185,36 +174,17 @@ def ode_likelihood(
         ode_func, 
         (encoded_latents, log_p), 
         timesteps, 
-        method='dopri5',
-        atol=1e-1,
-        rtol=1e-1,
+        method='rk4',
+        atol=1e-2,
+        rtol=1e-2,
     )
-    
-    breakpoint()
     
     latent_prior, log_likelihood_integration = result[0][-1], result[1][-1]
     
     log_likelihood = log_likelihood_integration + prior_likelihood(latent_prior, sigma=1) ##TODO find the exact sigma.
-    bpd = log_likelihood / 3 / 512 / 512 / torch.log(2) + 8.
-    
+    bpd = log_likelihood / 3 / 512 / 512 / np.log(2) + 8.
+    breakpoint()
     return log_likelihood, bpd, ode_func.nfe
     
-    # def divergence_eval(inputs, timesteps, score_model, epsilon):
-    #     score = score_eval_wrapper
-    #     with torch.enable_grad():
-    #         sample.requires_grad(True)
-    #         score_estimation = torch.sum(score_model(sample, timesteps) * epsilon)
-    #         gradient_score_estimation = torch.autograd.grad(score_estimation, sample)[0] 
-    #     return torch.sum(gradient_score_estimation * epsilon, dim=(1,2,3))
-    # def score_eval_wrapper(sample, timesteps):
-    #     if isinstance(sample, np.ndarray):
-    #         sample = torch.tensor(sample, device=device, dtype=torch.float32).reshape(shape)
-    #     if isinstance(timesteps, np.ndarray):
-    #         timesteps = torch.tensor(timesteps, device=device, dtype=torch.float32).reshape((sample.shape[0], ))
-    #     return score_model(sample, timesteps)
-    # def divergence_eval_wrapper(sample, timesteps):
-    #     if isinstance(sample, np.ndarray):
-    #         sample = torch.tensor(sample, device=device, dtype=torch.float32).reshape(shape)
-    #     if isinstance(timesteps, np.ndarray):
-    #         timesteps = torch.tensor(timesteps, device=device, dtype=torch.float32).reshape((sample.shape[0], ))
-    #     return divergence_eval(sample, timesteps)
+def image_decode(pipeline, latent):
+    pass
