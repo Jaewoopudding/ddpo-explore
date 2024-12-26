@@ -95,22 +95,39 @@ def ode_likelihood(
     # step 4 : skip the timestep preparation,
     # step 5 : prepare latent variables
     # step 6 : prepare extra step kwawrgs 
-    extra_step_kwargs = pipeline.prepare_extra_step_kwargs(generator, eta) 
-    for idx, image in enumerate(x):
-        plt.imsave(f'sample_images/{idx}_original.png', image.cpu().detach().numpy().transpose(1,2,0))
-        
-    image_processor = VaeImageProcessor(vae_scale_factor=pipeline.vae_scale_factor)
-    x = image_processor.preprocess(x, height, width)
+
+    x = pipeline.image_processor.preprocess(x, height, width)
     encoded_latents = pipeline.vae.encode( ### TODO stochasticity 제거하기
             x
     ).latent_dist.sample(generator) ###TODO we have to encode the given image and feed it to the pipeline
+    encoded_latents = encoded_latents * pipeline.vae.config.scaling_factor
     
-    images = image_decode(pipeline, encoded_latents)
-    for idx, image in enumerate(images):
-        plt.imsave(f'sample_images/{idx}_recon_original.png', image)
-        
-    breakpoint()
+    # get the sigma for the DDIM eq (14)
+    sigmas = (((1 - pipeline.scheduler.alphas_cumprod) / pipeline.scheduler.alphas_cumprod) ** 0.5).to(device).to(torch.float32)
     
+    def sigma_to_t(sigma):
+        log_sigma = torch.log(sigma)
+
+        # get distribution
+        dists = log_sigma - torch.log(sigmas)[:, None]
+
+        # get sigmas range
+        low_idx = torch.cumsum((dists >= 0), dim=0).argmax(dim=0).clamp(max=torch.log(sigmas).shape[0] - 2)
+        high_idx = low_idx + 1
+
+        low = torch.log(sigmas)[low_idx]
+        high = torch.log(sigmas)[high_idx]
+
+        # interpolate sigmas
+        w = (low - log_sigma) / (low - high)
+        w = torch.clamp(w, 0, 1)
+
+        # transform interpolation to time range
+        t = (1 - w) * low_idx + w * high_idx
+        return t[0]
+    
+                
+                
     class ODEFunc(nn.Module):
         def __init__(self, pipeline, prompt_embeds, device):
             super().__init__()
@@ -119,76 +136,97 @@ def ode_likelihood(
             self.nfe = 0
             self.device = device
             
-        def estimate_score_and_divergence(self, timesteps, inputs, epsilon):
+        def estimate_score_and_divergence(self, sigma, inputs, epsilon):
             latent_model_input, log_p = inputs 
-            latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, timesteps) ## TODO  이부분 timestep이 아니라 sigma 접근 필요함
-            latent_model_input = latent_model_input.requires_grad_(True) # 그리고 인풋을 sigma로 나누는? 상황을 연출하는데 왜그런지는 모르겠음
+            timestep = sigma_to_t(sigma)
+            
+            breakpoint()
+            latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, timestep).requires_grad_(True) / ((sigma ** 2 + 1) ** 0.5)
+            ## TODO  이부분 timestep이 아니라 sigma 접근 필요함
+            # 그리고 인풋을 sigma로 나누는? 상황을 연출하는데 왜그런지는 모르겠음
+            ## Solved -> DDIM eq (14) 에 의해  DDIM을 위한 sampler가 그렇게 정의되기 때문이다. 
             # https://github.com/Mattias421/clevr_diff/blob/main/sdxl_turbo_ll.py#L64
-            timesteps = timesteps.requires_grad_(True)
+            timestep = timestep.requires_grad_(True)
             print(log_p / 3 / 512 / 512 / torch.log(torch.tensor([2])).to(self.device))
-            betas = self.pipeline.scheduler.betas.to(self.device)
+            # betas = self.pipeline.scheduler.betas.to(self.device)
             with torch.enable_grad():
                 noise_pred = self.pipeline.unet(
                         latent_model_input,
-                        timesteps, ## TODO
+                        int(timestep), ## TODO int로 해야 하는가?
                         encoder_hidden_states=self.prompt_embeds,
                         cross_attention_kwargs=None,
                         return_dict=False,
                 )[0]
-                score = - noise_pred
-                weighted_score = score * epsilon.clone()
-                beta_t = betas.clone().gather(0, timesteps.to(torch.int64))
-                drift = -0.5 * beta_t * latent_model_input - 0.5 * beta_t * score
                 
-                # print("#"*50)
-                # print(f"latent_model_input: {latent_model_input.dtype}, {latent_model_input.requires_grad}")
-                # print(f"timesteps: {timesteps.dtype}, {timesteps.requires_grad}")
-                # print(f"prompt_embeds: {prompt_embeds.dtype}, {prompt_embeds.requires_grad}")
-                # print(f"drift: {drift.grad_fn}")
-                # print("#"*50)
-                
-                score_divergence_estimation = torch.sum(
-                    epsilon * torch.autograd.grad(
-                        torch.sum(weighted_score), latent_model_input
+                drift = noise_pred ## In case of DDIM sampler, drift equals the noise prediction
+                #fixed BUG: We should do this with DRIFT, not SCORE!!!
+                breakpoint()
+                divergence = torch.sum(
+                    torch.autograd.grad(
+                        torch.sum(drift * epsilon.clone()), latent_model_input
                     )[0], dim=(1,2,3)
                 )
+                
+                # beta_t = betas.clone().gather(0, timesteps.to(torch.int64)) # TODO 여기 문제 있네. timestep을 int로 밖에 쿼리 못하게 해 놨는데
+                # # beta는 사실은 어떤 함수를 따르고 있음.. continuous time으로 바꿔서 넣어줄 수 있어야 함.
+                # score = noise_pred ### TODO check it .
+                # breakpoint()
+                ## DDPM assumed. 
+                # f = - 0.5 * beta_t * latent_model_input
+                # g = torch.sqrt(beta_t)
+                # drift = f - 0.5 * g ** 2 * score
+                # breakpoint()
+                
+
+                # breakpoint()
+                
+
+                # weighted_score = score * epsilon.clone()
+                # drift = -0.5 * beta_t * latent_model_input - 0.5 * beta_t * score
+                
+                # score_divergence_estimation = torch.sum(
+                #     epsilon * torch.autograd.grad(
+                #         torch.sum(weighted_score), latent_model_input
+                #     )[0], dim=(1,2,3)
+                # )
                 
             
             # score_divergence_estimation = torch.sum(torch.autograd.grad(torch.sum(score * epsilon), latent_model_input)[0] * epsilon, dim=(1,2,3))
             
             
-            return drift, score_divergence_estimation
+            return drift, divergence
             
-        def forward(self, t, x):
-            print("timestep:", t)
+        def forward(self, sigma, x):
+            print("timestep:", sigma_to_t(sigma))
+            print("sigma:", sigma)
             self.nfe = self.nfe + 1
             print(self.nfe)
             epsilon = torch.randn_like(x[0])
-            drift, divergence = self.estimate_score_and_divergence(t, x, epsilon)
+            drift, divergence = self.estimate_score_and_divergence(sigma, x, epsilon)
             images = image_decode(self.pipeline, x[0])
             for idx, image in enumerate(images):
-                plt.imsave(f'sample_images/{idx}_{t}.png', image)
+                plt.imsave(f'sample_images/{idx}_{t}_{sigma}.png', image)
             return drift, divergence # latent, log_p
     
     # Skilling-Hutchinson's divergence estimator
     
     log_p = torch.zeros(shape[0]).to(device)
-    timesteps = pipeline.scheduler.timesteps.to(device).to(torch.float32).requires_grad_().flip(0) ## TODO: precision 16, 32
+    # timesteps = pipeline.scheduler.timesteps.to(device).to(torch.float32).requires_grad_().flip(0) ## TODO: precision 16, 32
     # breakpoint()
     # timesteps = torch.tensor([0, pipeline.scheduler.config.num_train_timesteps-1]).to(device).to(torch.float32).requires_grad_()
     
-    # 적응형 solver 쓸거면 (RK45) start값일아 end값만 넣어줘도 된다. 
+    # 적응형 solver 쓸거면 (RK45) start값이랑 end값만 넣어줘도 된다. 
     
     ode_func = ODEFunc(pipeline, prompt_embeds, device)
     # 왜인지 여기 debug에서는 되는데 odeint속으로 들어가면 float16, 32라던지, 안 맞는 것들이 생긴다. 
-    inputs = (encoded_latents, log_p) # for debug
-    ode_func(timesteps[0], inputs) # for debug
+    # inputs = (encoded_latents, log_p) # for debug
+    # ode_func(timesteps[0], inputs) # for debug
     
     print("odeint start")
     result = odeint(
         ode_func, 
         (encoded_latents, log_p), 
-        timesteps, 
+        sigmas.requires_grad_(), 
         method='euler',
         atol=1e-3,
         rtol=1e-3,
