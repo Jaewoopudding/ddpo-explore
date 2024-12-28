@@ -33,6 +33,12 @@ tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/explore.py", "Training configuration.")
+flags.DEFINE_integer('epoch_from', 0, 'epoch_from')
+flags.DEFINE_integer('epoch_to', 100, 'epoch_to')
+flags.DEFINE_integer('num_sample_per_epoch', 100, 'num_sample_per_epoch')
+flags.DEFINE_string('solver', 'dopri5', 'solver')
+flags.DEFINE_float('atol', 5e-2, 'atol')
+flags.DEFINE_float('rtol', 5e-2, 'rtol')
 
 logger = get_logger(__name__)
 
@@ -82,7 +88,7 @@ def main(_):
     )
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="Explorative-Diffusion-Finetuning",
+            project_name="Explorative-Diffusion-Finetuning-ll",
             config=config.to_dict(),
             init_kwargs={"wandb": {"name": config.reward_fn + f"_{config.train.gradient_accumulation_steps * accelerator.state.num_processes}_explore_v1",
                                    "group": config.prompt_fn}},
@@ -309,31 +315,74 @@ def main(_):
 
     if len(config.sample_path)>0:
         print(f"Loading pregenerated samples from {config.sample_path}")
-        latents = []
-        images = []
-        for device in range(4):
-            latent = torch.load(f"{config.sample_path}/latents_epoch_0_cuda:{device}.pt")
-            image = torch.load(f"{config.sample_path}/images_epoch_0_cuda:{device}.pt")
-            latents.append(latent)
-            images += image
         
-        samples = {k: torch.cat([l[k].cpu() for l in latents]) for k in latent.keys()}
+        
+        file_path = f"stats_from{FLAGS.epoch_from}_to{FLAGS.epoch_to}.txt"
+        for epoch in tqdm(
+            range(FLAGS.epoch_from, FLAGS.epoch_to),            # position=0,
+        ):
+            
+            # latents = []
+            # images = []
+        
+            # for device in range(4):
+            #     latent = torch.load(f"{config.sample_path}/latents_epoch_{epoch}_cuda:{device}.pt", map_location=accelerator.device)
+            #     image = torch.load(f"{config.sample_path}/images_epoch_{epoch}_cuda:{device}.pt", map_location=accelerator.device)
+            #     latents.append(latent)
+            #     images += image
+            # samples = {k: torch.cat([l[k].cpu() for l in latents]) for k in samples.keys()}
+            
+            samples = torch.load(f"{config.sample_path}/latents_epoch_{epoch}_cuda:0.pt", map_location=accelerator.device)
+            image = torch.load(f"{config.sample_path}/images_epoch_{epoch}_cuda:0.pt", map_location=accelerator.device)
+        
+            samples = {k: samples[k][:FLAGS.num_sample_per_epoch].cpu() for k in samples.keys()}
+            images = image[:FLAGS.num_sample_per_epoch]
 
+            # # breakpoint()
+            # idx = 0
+            # # sample_data = samples['latents'][idx, :]
+            # # sample_embed_prompts = samples['prompt_embeds'][:2, :, :]
+            # img = images[idx].repeat(2, 1, 1, 1).to(pipeline.unet.device, dtype=inference_dtype)
+            # prmpt = samples['prompt_embeds'][:2, :, :].to(pipeline.unet.device, dtype=inference_dtype)
+            
+            # log_likelihood, bpd, nfe = ode_likelihood(pipeline, img, prompt_embeds=prmpt)
+
+            # print(f"Log likelihood: {log_likelihood}")
+            # print(f"BPD: {bpd}")
+            # print(f"NFE: {nfe}")
+            
+            from ddpo_pytorch.diffusers_patch.likelihood import ode_likelihood
+            
+            bpds = []
+            log_likelihoods = []
+            nfes = []
+            for idx in range(len(images)):
+                img = images[idx].to(pipeline.unet.device, dtype=inference_dtype)
+                prmpt = samples['prompt_embeds'][idx, None, :, :].to(pipeline.unet.device, dtype=inference_dtype)
+                log_likelihood, bpd, nfe, trajectory, delta_ll_traj = ode_likelihood(pipeline, img, prompt_embeds=prmpt, solver=FLAGS.solver, atol=FLAGS.atol, rtol=FLAGS.rtol)
+                print(f"Log likelihood: {log_likelihood}")
+                print(f"BPD: {bpd}")
+                print(f"NFE: {nfe}")
+                bpds.append(bpd.item())
+                log_likelihoods.append(log_likelihood.item())
+                nfes.append(nfe)
+                # print(f"delta_ll_traj: {delta_ll_traj}")
+            
+            accelerator.log({
+                "epoch": epoch,
+                "bpd": np.mean(bpds),
+                "log_likelihood": np.mean(log_likelihoods),
+                "nfe": np.mean(nfes),
+                # "delta_ll_traj": delta_ll_traj.item()
+            })
+            
+
+            with open(file_path, "a") as file:
+                file.write(f"epoch: {epoch}, mean_bpd: {np.mean(bpds)}, mean_log_likelihood: {np.mean(log_likelihoods)}, mean_nfe: {np.mean(nfes)}, std_bpd: {np.std(bpds)}, std_log_likelihood: {np.std(log_likelihoods)}, std_nfe: {np.std(nfes)}\n")
+        # result = ode_likelihood(pipeline, images, prompt_embeds=samples['prompt_embeds'][:1, :, :])
+        
+        
         # breakpoint()
-        idx = 0
-        # sample_data = samples['latents'][idx, :]
-        # sample_embed_prompts = samples['prompt_embeds'][:2, :, :]
-        img = images[idx].repeat(2, 1, 1, 1).to(pipeline.unet.device, dtype=inference_dtype)
-        prmpt = samples['prompt_embeds'][:2, :, :].to(pipeline.unet.device, dtype=inference_dtype)
-        
-        log_likelihood, bpd, nfe = ode_likelihood(pipeline, img, prompt_embeds=prmpt)
-
-        print(f"Log likelihood: {log_likelihood}")
-        print(f"BPD: {bpd}")
-        print(f"NFE: {nfe}")
-        
-        
-        breakpoint()
 
     else:
         
@@ -507,14 +556,14 @@ def main(_):
         # for inner_epoch in range(config.train.num_inner_epochs):
         #     # shuffle samples along batch dimension
         #     perm = torch.randperm(total_batch_size, device=accelerator.device)
-        #     samples = {k: v[perm] for k, v in samples.items()}
+        # #     samples = {k: v[perm] for k, v in samples.items()}
 
-            breakpoint()
-            sample_data = samples['latents'][0, :]
-            sample_embed_prompts = samples['prompt_embeds'][:2, :, :]
-            result = ode_likelihood(pipeline, images.repeat(2, 1, 1, 1), prompt_embeds=samples['prompt_embeds'][:2, :, :])
-            breakpoint()
-            # #################### TRAINING ####################
+        # breakpoint()
+        # sample_data = samples['latents'][0, :]
+        # sample_embed_prompts = samples['prompt_embeds'][:2, :, :]
+        # result = ode_likelihood(pipeline, images.repeat(2, 1, 1, 1), prompt_embeds=samples['prompt_embeds'][:2, :, :])
+        # breakpoint()
+        # #################### TRAINING ####################
             # for inner_epoch in range(config.train.num_inner_epochs):
             #     # shuffle samples along batch dimension
             #     perm = torch.randperm(total_batch_size, device=accelerator.device)
