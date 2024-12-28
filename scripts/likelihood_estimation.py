@@ -306,319 +306,354 @@ def main(_):
         first_epoch = 0
 
     global_step = 0
-    for epoch in range(first_epoch, config.num_epochs):
-        #################### SAMPLING ####################
-        pipeline.unet.eval()
-        samples = []
-        prompts = []
-        for i in tqdm(
-            range(config.sample.num_batches_per_epoch),
-            desc=f"Epoch {epoch}: sampling",
-            disable=not accelerator.is_local_main_process,
-            position=0,
-        ):
-            # generate prompts
-            prompts, prompt_metadata = zip(
-                *[
-                    prompt_fn(**config.prompt_fn_kwargs)
-                    for _ in range(config.sample.batch_size)
-                ]
-            )
 
-            # encode prompts
-            prompt_ids = pipeline.tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=pipeline.tokenizer.model_max_length,
-            ).input_ids.to(accelerator.device)
-            prompt_embeds = pipeline.text_encoder(prompt_ids)[0]
+    if len(config.sample_path)>0:
+        print(f"Loading pregenerated samples from {config.sample_path}")
+        latents = []
+        images = []
+        for device in range(4):
+            latent = torch.load(f"{config.sample_path}/latents_epoch_0_cuda:{device}.pt")
+            image = torch.load(f"{config.sample_path}/images_epoch_0_cuda:{device}.pt")
+            latents.append(latent)
+            images += image
+        
+        samples = {k: torch.cat([l[k].cpu() for l in latents]) for k in latent.keys()}
 
-            # sample
-            with autocast():
-                images, _, latents, log_probs = pipeline_with_logprob(
-                    pipeline,
-                    prompt_embeds=prompt_embeds,
-                    negative_prompt_embeds=sample_neg_prompt_embeds,
-                    num_inference_steps=config.sample.num_steps,
-                    guidance_scale=config.sample.guidance_scale,
-                    eta=config.sample.eta,
-                    output_type="pt",
+        # breakpoint()
+        idx = 0
+        # sample_data = samples['latents'][idx, :]
+        # sample_embed_prompts = samples['prompt_embeds'][:2, :, :]
+        img = images[idx].repeat(2, 1, 1, 1).to(pipeline.unet.device, dtype=inference_dtype)
+        prmpt = samples['prompt_embeds'][:2, :, :].to(pipeline.unet.device, dtype=inference_dtype)
+        
+        log_likelihood, bpd, nfe = ode_likelihood(pipeline, img, prompt_embeds=prmpt)
+
+        print(f"Log likelihood: {log_likelihood}")
+        print(f"BPD: {bpd}")
+        print(f"NFE: {nfe}")
+        
+        
+        breakpoint()
+
+    else:
+        
+    
+        for epoch in range(first_epoch, config.num_epochs):
+            #################### SAMPLING ####################
+            pipeline.unet.eval()
+            samples = []
+            prompts = []
+            for i in tqdm(
+                range(config.sample.num_batches_per_epoch),
+                desc=f"Epoch {epoch}: sampling",
+                disable=not accelerator.is_local_main_process,
+                position=0,
+            ):
+                # generate prompts
+                prompts, prompt_metadata = zip(
+                    *[
+                        prompt_fn(**config.prompt_fn_kwargs)
+                        for _ in range(config.sample.batch_size)
+                    ]
                 )
 
-            latents = torch.stack(
-                latents, dim=1
-            )  # (batch_size, num_steps + 1, 4, 64, 64)
-            log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
-            timesteps = pipeline.scheduler.timesteps.repeat(
-                config.sample.batch_size, 1
-            )  # (batch_size, num_steps)
+                # encode prompts
+                prompt_ids = pipeline.tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=pipeline.tokenizer.model_max_length,
+                ).input_ids.to(accelerator.device)
+                prompt_embeds = pipeline.text_encoder(prompt_ids)[0]
 
-            # compute rewards asynchronously
-            rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
-            # yield to to make sure reward computation starts
-            time.sleep(0)
+                # sample
+                with autocast():
+                    images, _, latents, log_probs = pipeline_with_logprob(
+                        pipeline,
+                        prompt_embeds=prompt_embeds,
+                        negative_prompt_embeds=sample_neg_prompt_embeds,
+                        num_inference_steps=config.sample.num_steps,
+                        guidance_scale=config.sample.guidance_scale,
+                        eta=config.sample.eta,
+                        output_type="pt",
+                    )
 
-            samples.append(
-                {
-                    "prompt_ids": prompt_ids,
-                    "prompt_embeds": prompt_embeds,
-                    "timesteps": timesteps,
-                    "latents": latents[
-                        :, :-1
-                    ],  # each entry is the latent before timestep t
-                    "next_latents": latents[
-                        :, 1:
-                    ],  # each entry is the latent after timestep t
-                    "log_probs": log_probs,
-                    "rewards": rewards,
-                }
-            )
+                latents = torch.stack(
+                    latents, dim=1
+                )  # (batch_size, num_steps + 1, 4, 64, 64)
+                log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
+                timesteps = pipeline.scheduler.timesteps.repeat(
+                    config.sample.batch_size, 1
+                )  # (batch_size, num_steps)
 
-        # wait for all rewards to be computed
-        for sample in tqdm(
-            samples,
-            desc="Waiting for rewards",
-            disable=not accelerator.is_local_main_process,
-            position=0,
-        ):
-            rewards, reward_metadata = sample["rewards"].result()
-            # accelerator.print(reward_metadata)
-            sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
+                # compute rewards asynchronously
+                rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
+                # yield to to make sure reward computation starts
+                time.sleep(0)
 
-        # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
-        samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
-
-        # this is a hack to force wandb to log the images as JPEGs instead of PNGs
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for i, image in enumerate(images):
-                pil = Image.fromarray(
-                    (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                samples.append(
+                    {
+                        "prompt_ids": prompt_ids,
+                        "prompt_embeds": prompt_embeds,
+                        "timesteps": timesteps,
+                        "latents": latents[
+                            :, :-1
+                        ],  # each entry is the latent before timestep t
+                        "next_latents": latents[
+                            :, 1:
+                        ],  # each entry is the latent after timestep t
+                        "log_probs": log_probs,
+                        "rewards": rewards,
+                    }
                 )
-                pil = pil.resize((256, 256))
-                pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+
+            # wait for all rewards to be computed
+            for sample in tqdm(
+                samples,
+                desc="Waiting for rewards",
+                disable=not accelerator.is_local_main_process,
+                position=0,
+            ):
+                rewards, reward_metadata = sample["rewards"].result()
+                # accelerator.print(reward_metadata)
+                sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
+
+            # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
+            samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
+
+            # this is a hack to force wandb to log the images as JPEGs instead of PNGs
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for i, image in enumerate(images):
+                    pil = Image.fromarray(
+                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                    )
+                    pil = pil.resize((256, 256))
+                    pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+                accelerator.log(
+                    {
+                        "images": [
+                            wandb.Image(
+                                os.path.join(tmpdir, f"{i}.jpg"),
+                                caption=f"{prompt:.25} | {reward:.2f}",
+                            )
+                            for i, (prompt, reward) in enumerate(
+                                zip(prompts, rewards)
+                            )  # only log rewards from process 0
+                        ],
+                    },
+                    step=global_step,
+                )
+
+            # gather rewards across processes
+            rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
+
+            # log rewards and images
             accelerator.log(
                 {
-                    "images": [
-                        wandb.Image(
-                            os.path.join(tmpdir, f"{i}.jpg"),
-                            caption=f"{prompt:.25} | {reward:.2f}",
-                        )
-                        for i, (prompt, reward) in enumerate(
-                            zip(prompts, rewards)
-                        )  # only log rewards from process 0
-                    ],
+                    "reward": rewards,
+                    "epoch": epoch,
+                    "reward_mean": rewards.mean(),
+                    "reward_std": rewards.std(),
                 },
                 step=global_step,
             )
 
-        # gather rewards across processes
-        rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
+            # per-prompt mean/std tracking
+            if config.per_prompt_stat_tracking:
+                # gather the prompts across processes
+                prompt_ids = accelerator.gather(samples["prompt_ids"]).cpu().numpy()
+                prompts = pipeline.tokenizer.batch_decode(
+                    prompt_ids, skip_special_tokens=True
+                )
+                advantages = stat_tracker.update(prompts, rewards)
+            else:
+                advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
-        # log rewards and images
-        accelerator.log(
-            {
-                "reward": rewards,
-                "epoch": epoch,
-                "reward_mean": rewards.mean(),
-                "reward_std": rewards.std(),
-            },
-            step=global_step,
-        )
-
-        # per-prompt mean/std tracking
-        if config.per_prompt_stat_tracking:
-            # gather the prompts across processes
-            prompt_ids = accelerator.gather(samples["prompt_ids"]).cpu().numpy()
-            prompts = pipeline.tokenizer.batch_decode(
-                prompt_ids, skip_special_tokens=True
+            # ungather advantages; we only need to keep the entries corresponding to the samples on this process
+            samples["advantages"] = (
+                torch.as_tensor(advantages)
+                .reshape(accelerator.num_processes, -1)[accelerator.process_index]
+                .to(accelerator.device)
             )
-            advantages = stat_tracker.update(prompts, rewards)
-        else:
-            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
-        # ungather advantages; we only need to keep the entries corresponding to the samples on this process
-        samples["advantages"] = (
-            torch.as_tensor(advantages)
-            .reshape(accelerator.num_processes, -1)[accelerator.process_index]
-            .to(accelerator.device)
-        )
+            del samples["rewards"]
+            del samples["prompt_ids"]
 
-        del samples["rewards"]
-        del samples["prompt_ids"]
+            total_batch_size, num_timesteps = samples["timesteps"].shape
+            assert (
+                total_batch_size
+                == config.sample.batch_size * config.sample.num_batches_per_epoch
+            )
+            assert num_timesteps == config.sample.num_steps
 
-        total_batch_size, num_timesteps = samples["timesteps"].shape
-        assert (
-            total_batch_size
-            == config.sample.batch_size * config.sample.num_batches_per_epoch
-        )
-        assert num_timesteps == config.sample.num_steps
-        sample_data = samples['latents'][0, :]
-        sample_embed_prompts = samples['prompt_embeds'][:2, :, :]
-        result = ode_likelihood(pipeline, images.repeat(2, 1, 1, 1), prompt_embeds=samples['prompt_embeds'][:2, :, :])
-        breakpoint()
-        # #################### TRAINING ####################
-        # for inner_epoch in range(config.train.num_inner_epochs):
-        #     # shuffle samples along batch dimension
-        #     perm = torch.randperm(total_batch_size, device=accelerator.device)
-        #     samples = {k: v[perm] for k, v in samples.items()}
 
-        #     # shuffle along time dimension independently for each sample
-        #     perms = torch.stack(
-        #         [
-        #             torch.randperm(num_timesteps, device=accelerator.device)
-        #             for _ in range(total_batch_size)
-        #         ]
-        #     )
-        #     for key in ["timesteps", "latents", "next_latents", "log_probs"]:
-        #         samples[key] = samples[key][
-        #             torch.arange(total_batch_size, device=accelerator.device)[:, None],
-        #             perms,
-        #         ]
+            breakpoint()
+            sample_data = samples['latents'][0, :]
+            sample_embed_prompts = samples['prompt_embeds'][:2, :, :]
+            result = ode_likelihood(pipeline, images.repeat(2, 1, 1, 1), prompt_embeds=samples['prompt_embeds'][:2, :, :])
+            breakpoint()
+            # #################### TRAINING ####################
+            # for inner_epoch in range(config.train.num_inner_epochs):
+            #     # shuffle samples along batch dimension
+            #     perm = torch.randperm(total_batch_size, device=accelerator.device)
+            #     samples = {k: v[perm] for k, v in samples.items()}
 
-        #     # rebatch for training
-        #     samples_batched = {
-        #         k: v.reshape(-1, config.train.batch_size, *v.shape[1:])
-        #         for k, v in samples.items()
-        #     }
+            #     # shuffle along time dimension independently for each sample
+            #     perms = torch.stack(
+            #         [
+            #             torch.randperm(num_timesteps, device=accelerator.device)
+            #             for _ in range(total_batch_size)
+            #         ]
+            #     )
+            #     for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+            #         samples[key] = samples[key][
+            #             torch.arange(total_batch_size, device=accelerator.device)[:, None],
+            #             perms,
+            #         ]
 
-        #     # dict of lists -> list of dicts for easier iteration
-        #     samples_batched = [
-        #         dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
-        #     ]
+            #     # rebatch for training
+            #     samples_batched = {
+            #         k: v.reshape(-1, config.train.batch_size, *v.shape[1:])
+            #         for k, v in samples.items()
+            #     }
 
-        #     # train
-        #     pipeline.unet.train()
-        #     info = defaultdict(list)
-        #     for i, sample in tqdm(
-        #         list(enumerate(samples_batched)),
-        #         desc=f"Epoch {epoch}.{inner_epoch}: training",
-        #         position=0,
-        #         disable=not accelerator.is_local_main_process,
-        #     ):
-        #         if config.train.cfg:
-        #             # concat negative prompts to sample prompts to avoid two forward passes
-        #             embeds = torch.cat(
-        #                 [train_neg_prompt_embeds, sample["prompt_embeds"]]
-        #             )
-        #         else:
-        #             embeds = sample["prompt_embeds"]
+            #     # dict of lists -> list of dicts for easier iteration
+            #     samples_batched = [
+            #         dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
+            #     ]
+
+            #     # train
+            #     pipeline.unet.train()
+            #     info = defaultdict(list)
+            #     for i, sample in tqdm(
+            #         list(enumerate(samples_batched)),
+            #         desc=f"Epoch {epoch}.{inner_epoch}: training",
+            #         position=0,
+            #         disable=not accelerator.is_local_main_process,
+            #     ):
+            #         if config.train.cfg:
+            #             # concat negative prompts to sample prompts to avoid two forward passes
+            #             embeds = torch.cat(
+            #                 [train_neg_prompt_embeds, sample["prompt_embeds"]]
+            #             )
+            #         else:
+            #             embeds = sample["prompt_embeds"]
+                        
+                        
+            #         accumulated_log_prob = 0 
                     
                     
-        #         accumulated_log_prob = 0 
-                
-                
-        #         for j in tqdm(
-        #             range(num_train_timesteps),
-        #             desc="Timestep",
-        #             position=1,
-        #             leave=False,
-        #             disable=not accelerator.is_local_main_process,
-        #         ):
-        #             with accelerator.accumulate(unet):
-        #                 with autocast():
+            #         for j in tqdm(
+            #             range(num_train_timesteps),
+            #             desc="Timestep",
+            #             position=1,
+            #             leave=False,
+            #             disable=not accelerator.is_local_main_process,
+            #         ):
+            #             with accelerator.accumulate(unet):
+            #                 with autocast():
+                                
+            #                     if config.train.cfg:
+            #                         noise_pred = unet(
+            #                             torch.cat([sample["latents"][:, j]] * 2),
+            #                             torch.cat([sample["timesteps"][:, j]] * 2),
+            #                             embeds,
+            #                         ).sample
+            #                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            #                         noise_pred = (
+            #                             noise_pred_uncond
+            #                             + config.sample.guidance_scale
+            #                             * (noise_pred_text - noise_pred_uncond)
+            #                         )
+            #                     else:
+            #                         noise_pred = unet(
+            #                             sample["latents"][:, j],
+            #                             sample["timesteps"][:, j],
+            #                             embeds,
+            #                         ).sample
+            #                     # compute the log prob of next_latents given latents under the current model
+            #                     _, log_prob = ddim_step_with_logprob(
+            #                         pipeline.scheduler,
+            #                         noise_pred,
+            #                         sample["timesteps"][:, j],
+            #                         sample["latents"][:, j],
+            #                         eta=config.sample.eta,
+            #                         prev_sample=sample["next_latents"][:, j],
+            #                     )
                             
-        #                     if config.train.cfg:
-        #                         noise_pred = unet(
-        #                             torch.cat([sample["latents"][:, j]] * 2),
-        #                             torch.cat([sample["timesteps"][:, j]] * 2),
-        #                             embeds,
-        #                         ).sample
-        #                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        #                         noise_pred = (
-        #                             noise_pred_uncond
-        #                             + config.sample.guidance_scale
-        #                             * (noise_pred_text - noise_pred_uncond)
-        #                         )
-        #                     else:
-        #                         noise_pred = unet(
-        #                             sample["latents"][:, j],
-        #                             sample["timesteps"][:, j],
-        #                             embeds,
-        #                         ).sample
-        #                     # compute the log prob of next_latents given latents under the current model
-        #                     _, log_prob = ddim_step_with_logprob(
-        #                         pipeline.scheduler,
-        #                         noise_pred,
-        #                         sample["timesteps"][:, j],
-        #                         sample["latents"][:, j],
-        #                         eta=config.sample.eta,
-        #                         prev_sample=sample["next_latents"][:, j],
-        #                     )
-                        
-                        
-        #                 ####### EXPLORATION VIA DENSITY #########
-        #                 accumulated_log_prob += log_prob
-        #                 accumulated_old_log_prob = sample["log_probs"][:, :j+1].sum(1)
-        #                 explore_sum_ratio = torch.exp(accumulated_log_prob - accumulated_old_log_prob)
-        #                 exponentiated_ratio = torch.pow(explore_sum_ratio, config.explore.decay / np.sqrt((float(global_step) + 1.0) * total_train_batch_size))
-        #                 intrinsic_reward = config.explore.beta * (torch.sqrt(torch.clamp(exponentiated_ratio, min=1.0) - 1))
-        #                 accelerator.backward(-intrinsic_reward, retain_graph=True)
+                            
+            #                 ####### EXPLORATION VIA DENSITY #########
+            #                 accumulated_log_prob += log_prob
+            #                 accumulated_old_log_prob = sample["log_probs"][:, :j+1].sum(1)
+            #                 explore_sum_ratio = torch.exp(accumulated_log_prob - accumulated_old_log_prob)
+            #                 exponentiated_ratio = torch.pow(explore_sum_ratio, config.explore.decay / np.sqrt((float(global_step) + 1.0) * total_train_batch_size))
+            #                 intrinsic_reward = config.explore.beta * (torch.sqrt(torch.clamp(exponentiated_ratio, min=1.0) - 1))
+            #                 accelerator.backward(-intrinsic_reward, retain_graph=True)
 
-        #                 # ppo logic
-        #                 advantages = torch.clamp(
-        #                     sample["advantages"],
-        #                     -config.train.adv_clip_max,
-        #                     config.train.adv_clip_max,
-        #                 )
-        #                 ratio = torch.exp(log_prob - sample["log_probs"][:, j])
-        #                 unclipped_loss = -advantages * ratio
-        #                 clipped_loss = -advantages * torch.clamp(
-        #                     ratio,
-        #                     1.0 - config.train.clip_range,
-        #                     1.0 + config.train.clip_range,
-        #                 )
-        #                 loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) 
-                        
-                        
+            #                 # ppo logic
+            #                 advantages = torch.clamp(
+            #                     sample["advantages"],
+            #                     -config.train.adv_clip_max,
+            #                     config.train.adv_clip_max,
+            #                 )
+            #                 ratio = torch.exp(log_prob - sample["log_probs"][:, j])
+            #                 unclipped_loss = -advantages * ratio
+            #                 clipped_loss = -advantages * torch.clamp(
+            #                     ratio,
+            #                     1.0 - config.train.clip_range,
+            #                     1.0 + config.train.clip_range,
+            #                 )
+            #                 loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) 
+                            
+                            
 
-        #                 # debugging values
-        #                 # John Schulman says that (ratio - 1) - log(ratio) is a better
-        #                 # estimator, but most existing code uses this so...
-        #                 # http://joschu.net/blog/kl-approx.html
-        #                 info["approx_kl"].append(
-        #                     0.5
-        #                     * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
-        #                 )
-        #                 info["clipfrac"].append(
-        #                     torch.mean(
-        #                         (
-        #                             torch.abs(ratio - 1.0) > config.train.clip_range # 1e-4
-        #                         ).float()
-        #                     )
-        #                 )
+            #                 # debugging values
+            #                 # John Schulman says that (ratio - 1) - log(ratio) is a better
+            #                 # estimator, but most existing code uses this so...
+            #                 # http://joschu.net/blog/kl-approx.html
+            #                 info["approx_kl"].append(
+            #                     0.5
+            #                     * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
+            #                 )
+            #                 info["clipfrac"].append(
+            #                     torch.mean(
+            #                         (
+            #                             torch.abs(ratio - 1.0) > config.train.clip_range # 1e-4
+            #                         ).float()
+            #                     )
+            #                 )
 
-        #                 info["loss"].append(loss)
-        #                 info["intrinsic reward"].append(intrinsic_reward)
+            #                 info["loss"].append(loss)
+            #                 info["intrinsic reward"].append(intrinsic_reward)
 
-        #                 # backward pass
-        #                 accelerator.backward(loss)
-        #                 if accelerator.sync_gradients:
-        #                     accelerator.clip_grad_norm_(
-        #                         unet.parameters(), config.train.max_grad_norm
-        #                     )
-        #                 optimizer.step()
-        #                 optimizer.zero_grad()
+            #                 # backward pass
+            #                 accelerator.backward(loss)
+            #                 if accelerator.sync_gradients:
+            #                     accelerator.clip_grad_norm_(
+            #                         unet.parameters(), config.train.max_grad_norm
+            #                     )
+            #                 optimizer.step()
+            #                 optimizer.zero_grad()
 
-        #             # Checks if the accelerator has performed an optimization step behind the scenes
-        #             if accelerator.sync_gradients:
-        #                 assert (j == num_train_timesteps - 1) and (
-        #                     i + 1
-        #                 ) % config.train.gradient_accumulation_steps == 0
-        #                 # log training-related stuff
-        #                 info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-        #                 info = accelerator.reduce(info, reduction="mean")
-        #                 info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-        #                 accelerator.log(info, step=global_step)
-        #                 global_step += 1
-        #                 info = defaultdict(list)
+            #             # Checks if the accelerator has performed an optimization step behind the scenes
+            #             if accelerator.sync_gradients:
+            #                 assert (j == num_train_timesteps - 1) and (
+            #                     i + 1
+            #                 ) % config.train.gradient_accumulation_steps == 0
+            #                 # log training-related stuff
+            #                 info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+            #                 info = accelerator.reduce(info, reduction="mean")
+            #                 info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+            #                 accelerator.log(info, step=global_step)
+            #                 global_step += 1
+            #                 info = defaultdict(list)
 
-        #     # make sure we did an optimization step at the end of the inner epoch
-        #     assert accelerator.sync_gradients
+            #     # make sure we did an optimization step at the end of the inner epoch
+            #     assert accelerator.sync_gradients
 
-        # if epoch != 0 and epoch % config.save_freq == 0 and accelerator.is_main_process:
-        #     accelerator.save_state()
+            # if epoch != 0 and epoch % config.save_freq == 0 and accelerator.is_main_process:
+            #     accelerator.save_state()
 
 
 if __name__ == "__main__":
