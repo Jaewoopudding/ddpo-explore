@@ -113,7 +113,7 @@ def ode_likelihood(
     sampled_sigmas = sigmas[::step_size]
     sampled_sigmas = sampled_sigmas[(sampled_sigmas >= sigmas[timestep - 1])]
     if timestep == 1:
-        sampled_sigmas = torch.cat([torch.tensor(0).to(device), sampled_sigmas])
+        sampled_sigmas = torch.cat([torch.tensor([1e-6]).to(device), sampled_sigmas])
     
     # timestep 0 들어오면 이미지 들어온거임 -> 50번 ode sample해야 함. 
     # timestep 1000 들어오면 노이즈 들어온거임
@@ -195,11 +195,8 @@ def ode_likelihood(
         atol=1e-3,
         rtol=1e-3,
     )
-    
-    breakpoint()
     trajectory, delta_ll_traj = result[0], result[1]
     prior, delta_ll= trajectory[-1], delta_ll_traj[-1]
-    breakpoint()
     log_likelihood = delta_ll + get_prior_likelihood(prior, sigma=sigmas.max().item())
     bpd = log_likelihood / 4 / 64 / 64 / np.log(2)
     return log_likelihood, bpd, ode_func.nfe, trajectory, delta_ll_traj
