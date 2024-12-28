@@ -3,6 +3,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 import matplotlib.pyplot as plt
 from torchdiffeq import odeint_adjoint as odeint
 from diffusers.image_processor import VaeImageProcessor
@@ -45,7 +46,6 @@ def ode_likelihood(
     guidance_rescale: float = 0.0,
     num_inference_steps: int = 50
 ):
-    
     # step 0
     height = height or pipeline.unet.config.sample_size * pipeline.vae_scale_factor
     width = width or pipeline.unet.config.sample_size * pipeline.vae_scale_factor
@@ -138,10 +138,16 @@ def ode_likelihood(
         def __init__(self, pipeline, prompt_embeds, device, verbose=True):
             super().__init__()
             self.pipeline = pipeline
-            self.prompt_embeds = prompt_embeds
+            self.prompt_embeds = prompt_embeds.requires_grad_(True)
             self.nfe = 0
             self.device = device
             self.verbose = verbose
+            
+        # def checkpoint_forward(self, latent, timestep, encoder_hidden_states, cross_attention_kwargs):
+        #     def custom_forward(*inputs):
+        #         return unet(*inputs, encoder_hidden_states=prompt_embeds, return_dict=False)[0]
+        #     x = checkpoint(custom_forward, x, t)
+        #     return x
             
         def estimate_drift_and_divergence(self, sigma, inputs):
             with torch.enable_grad():
@@ -150,42 +156,45 @@ def ode_likelihood(
                 epsilon = torch.randint_like(inputs[0], 2) * 2 - 1
                 latent, log_p = inputs 
                 latent = latent.to(self.pipeline.unet.dtype).requires_grad_(True)
-                scaled_latent = latent / ((sigma ** 2 + 1) ** 0.5)
-                scaled_latent = scaled_latent
+                scaled_latent = latent / ((sigma ** 2 + 1) ** 0.5)        
                 noise_pred = self.pipeline.unet(
                         scaled_latent,
-                        int(timestep), ## TODO int로 해야 하는가?
-                        encoder_hidden_states=self.prompt_embeds[-1:], # for classifier free guidance
+                        int(timestep),
+                        encoder_hidden_states=self.prompt_embeds, # for classifier free guidance
                         cross_attention_kwargs=None,
                         return_dict=False,
                 )[0]
                 drift = noise_pred
                 divergence = torch.sum(
                     torch.autograd.grad(
-                        torch.sum(drift * epsilon.clone()), latent
+                        torch.sum(drift * epsilon.clone()), 
+                        latent,
+                        create_graph=True
                     )[0] * epsilon, dim=(1,2,3)
                 )
             return drift, divergence
             
         def forward(self, sigma, x):
             self.nfe = self.nfe + 1
-            drift, divergence = self.estimate_drift_and_divergence(sigma, x)
-            
-            if self.verbose:
-                print("-------"*5)
-                print(f"nfe: {self.nfe}")
-                print(f"sigma: {sigma}")
-                print(f"t: {sigma_to_t(sigma)}")
-                print(f"d_ll: {divergence}")
-                print(f"ll: {x[1]}")
-            return drift, divergence
+            with torch.enable_grad():
+                drift, divergence = self.estimate_drift_and_divergence(sigma, x)
+                
+                if self.verbose:
+                    print("-------"*5)
+                    print(f"nfe: {self.nfe}")
+                    print(f"sigma: {sigma}")
+                    print(f"t: {sigma_to_t(sigma)}")
+                    print(f"d_ll: {divergence}")
+                    print(f"ll: {x[1]}")
+                breakpoint()
+                return drift, divergence
         
     ode_func = ODEFunc(pipeline, prompt_embeds, device)
     sigma_max = sigmas.max()
     sigma_min = sigmas[timestep - 1]
     result = odeint(
         ode_func, 
-        (encoded_latents, torch.zeros(encoded_latents.shape[0]).to(device)),  #encoded image and the zero likelihood
+        (encoded_latents.requires_grad_(), torch.zeros(encoded_latents.shape[0]).to(device).requires_grad_()),  #encoded image and the zero likelihood
         # torch.linspace(1e-4, sigma_max, steps=num_inference_steps).to(device),
         # torch.tensor([1e-4, sigma_max]).to(device),
         # torch.cat([torch.tensor([1e-4]).to(device), sigmas[:timestep - 1][::20], torch.tensor([sigma_max]).to(device)]),
@@ -199,6 +208,39 @@ def ode_likelihood(
     prior, delta_ll= trajectory[-1], delta_ll_traj[-1]
     log_likelihood = delta_ll + get_prior_likelihood(prior, sigma=sigmas.max().item())
     bpd = log_likelihood / 4 / 64 / 64 / np.log(2)
+    
+    # latents = torch.randn_like(encoded_latents).to(device)
+    
+    # result = odeint(
+    #     ode_func, 
+    #     (latents, torch.zeros(encoded_latents.shape[0]).to(device)),  #encoded image and the zero likelihood
+    #     # torch.linspace(1e-4, sigma_max, steps=num_inference_steps).to(device),
+    #     # torch.tensor([1e-4, sigma_max]).to(device),
+    #     # torch.cat([torch.tensor([1e-4]).to(device), sigmas[:timestep - 1][::20], torch.tensor([sigma_max]).to(device)]),
+    #     # torch.cat([torch.tensor([1e-4]).to(device), sigmas[:timestep - 1][::20]]),
+    #     sampled_sigmas.flip(0),
+    #     method='euler',
+    #     atol=1e-3,
+    #     rtol=1e-3,
+    # )
+    # img = image_decode(pipeline, result[0][-1])
+    # plt.imsave("randn_decoding.png", img[0])
+    
+    # result = odeint(
+    #     ode_func, 
+    #     (latents * sigmas.max(), torch.zeros(encoded_latents.shape[0]).to(device)),  #encoded image and the zero likelihood
+    #     # torch.linspace(1e-4, sigma_max, steps=num_inference_steps).to(device),
+    #     # torch.tensor([1e-4, sigma_max]).to(device),
+    #     # torch.cat([torch.tensor([1e-4]).to(device), sigmas[:timestep - 1][::20], torch.tensor([sigma_max]).to(device)]),
+    #     # torch.cat([torch.tensor([1e-4]).to(device), sigmas[:timestep - 1][::20]]),
+    #     sampled_sigmas.flip(0),
+    #     method='euler',
+    #     atol=1e-3,
+    #     rtol=1e-3,
+    # )
+    # img = image_decode(pipeline, result[0][-1])
+    # plt.imsave("randn_sigma_decoding.png", img[0])
+    
     return log_likelihood, bpd, ode_func.nfe, trajectory, delta_ll_traj
     
 def image_decode(pipeline, latents):

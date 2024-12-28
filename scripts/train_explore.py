@@ -457,6 +457,18 @@ def main(_):
 
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
+            ## In case of deterministic sampling like DDIM, It is possible to pre-calculate the intrinsic reward
+            marginal_ll, bpd, nfe, trajectory, delta_ll_traj = ode_likelihood(
+                pipeline, 
+                latent=samples["latents"][:, -1], 
+                timestep=1,
+                prompt_embeds=samples["prompt_embeds"], ##TODO FIX
+            )
+            c = config.explore.decay
+            n = (epoch + 1) * total_train_batch_size
+            intrinsic_reward = torch.sqrt(torch.exp((delta_ll_traj - delta_ll_traj.detach()) * (c / np.sqrt(n))) - 1)[1: -1].transpose(0, 1)
+            
+            breakpoint()
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=accelerator.device)
             samples = {k: v[perm] for k, v in samples.items()}
@@ -504,12 +516,12 @@ def main(_):
                     embeds = sample["prompt_embeds"]
                 accumulated_log_prob = 0 
                 
-                ############## INTRINSIC REWARD SIMULATION ##############
-                marginal_ll, bpd, nfe = ode_likelihood(pipeline, 
-                    latent=sample["latents"][:, j], 
-                    timestep=sample["timesteps"][:, j].item(),
-                    prompt_embeds=embeds,
-                )
+                # ############## INTRINSIC REWARD SIMULATION ##############
+                # marginal_ll, bpd, nfe = ode_likelihood(pipeline, 
+                #     latent=sample["latents"][:, j], 
+                #     timestep=sample["timesteps"][:, j].item(),
+                #     prompt_embeds=embeds,
+                # )
                 
                 
                 for j in tqdm(
@@ -551,16 +563,13 @@ def main(_):
                             )
                         
                         
-                            ####### EXPLORATION VIA DENSITY #########
-                            marginal_ll, bpd, nfe = ode_likelihood(pipeline, 
-                                latent=sample["latents"][:, j], 
-                                timestep=sample["timesteps"][:, j].item(),
-                                prompt_embeds=embeds,
-                            ) ##TODO embed is not needed
+                            # ####### EXPLORATION VIA DENSITY #########
+                            # marginal_ll, bpd, nfe = ode_likelihood(pipeline, 
+                            #     latent=sample["latents"][:, j], 
+                            #     timestep=sample["timesteps"][:, j].item(),
+                            #     prompt_embeds=embeds,
+                            # ) ##TODO embed is not needed
                         
-                        c = config.explore.decay
-                        n = (epoch + 1) * total_train_batch_size
-                        breakpoint()
                         # intrinsic_reward = torch.sqrt(torch.exp((marginal_ll - marginal_ll.detach()) * (c / np.sqrt(n))) - 1)
                         
                         # ppo logic
