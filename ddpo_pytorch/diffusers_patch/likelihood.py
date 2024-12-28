@@ -112,12 +112,12 @@ def ode_likelihood(
     # sigmas = torch.cat([torch.tensor(0).to(device), sigmas]) # 1001
     sampled_sigmas = sigmas[::step_size]
     sampled_sigmas = sampled_sigmas[(sampled_sigmas >= sigmas[timestep - 1])]
+    sampled_sigmas = torch.cat([sampled_sigmas, sigmas.max()[None]])
     if timestep == 1:
         sampled_sigmas = torch.cat([torch.tensor([1e-6]).to(device), sampled_sigmas])
     
-    # timestep 0 들어오면 이미지 들어온거임 -> 50번 ode sample해야 함. 
+    # timestep 1 들어오면 이미지 들어온거임 -> 50번 ode sample해야 함. 
     # timestep 1000 들어오면 노이즈 들어온거임
-    
     def sigma_to_t(sigma):
         log_sigma = torch.log(sigma)
         # get distribution
@@ -191,7 +191,7 @@ def ode_likelihood(
         # torch.cat([torch.tensor([1e-4]).to(device), sigmas[:timestep - 1][::20], torch.tensor([sigma_max]).to(device)]),
         # torch.cat([torch.tensor([1e-4]).to(device), sigmas[:timestep - 1][::20]]),
         sampled_sigmas,
-        method='dopri5',
+        method='euler',
         atol=1e-3,
         rtol=1e-3,
     )
