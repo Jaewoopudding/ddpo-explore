@@ -44,7 +44,10 @@ def ode_likelihood(
     callback_steps: int = 1,
     cross_attention_kwargs: Optional[Dict[str, Any]] = None,
     guidance_rescale: float = 0.0,
-    num_inference_steps: int = 50
+    num_inference_steps: int = 50,
+    solver: str = "dopri5",
+    atol: float = 5e-2,
+    rtol: float = 5e-2,
 ):
     # step 0
     height = height or pipeline.unet.config.sample_size * pipeline.vae_scale_factor
@@ -115,6 +118,8 @@ def ode_likelihood(
     sampled_sigmas = torch.cat([sampled_sigmas, sigmas.max()[None]])
     if timestep == 1:
         sampled_sigmas = torch.cat([torch.tensor([1e-6]).to(device), sampled_sigmas])
+        
+    epsilon = torch.randint_like(encoded_latents[0], 2) * 2 - 1
     
     # timestep 1 들어오면 이미지 들어온거임 -> 50번 ode sample해야 함. 
     # timestep 1000 들어오면 노이즈 들어온거임
@@ -135,7 +140,7 @@ def ode_likelihood(
         return t[0]
                 
     class ODEFunc(nn.Module):
-        def __init__(self, pipeline, prompt_embeds, device, verbose=True):
+        def __init__(self, pipeline, prompt_embeds, device, verbose=False):
             super().__init__()
             self.pipeline = pipeline
             self.prompt_embeds = prompt_embeds.requires_grad_(True)
@@ -153,7 +158,7 @@ def ode_likelihood(
             with torch.enable_grad():
                 timestep = sigma_to_t(sigma)
                 timestep = timestep.requires_grad_()
-                epsilon = torch.randint_like(inputs[0], 2) * 2 - 1
+                # epsilon = torch.randint_like(inputs[0], 2) * 2 - 1
                 latent, log_p = inputs 
                 latent = latent.to(self.pipeline.unet.dtype).requires_grad_(True)
                 scaled_latent = latent / ((sigma ** 2 + 1) ** 0.5)        
@@ -186,7 +191,7 @@ def ode_likelihood(
                     print(f"t: {sigma_to_t(sigma)}")
                     print(f"d_ll: {divergence}")
                     print(f"ll: {x[1]}")
-                breakpoint()
+                # breakpoint()
                 return drift, divergence
         
     ode_func = ODEFunc(pipeline, prompt_embeds, device)
@@ -200,10 +205,11 @@ def ode_likelihood(
         # torch.cat([torch.tensor([1e-4]).to(device), sigmas[:timestep - 1][::20], torch.tensor([sigma_max]).to(device)]),
         # torch.cat([torch.tensor([1e-4]).to(device), sigmas[:timestep - 1][::20]]),
         sampled_sigmas,
-        method='euler',
-        atol=1e-3,
-        rtol=1e-3,
+        method=solver,
+        atol=atol,
+        rtol=rtol,
     )
+    breakpoint()
     trajectory, delta_ll_traj = result[0], result[1]
     prior, delta_ll= trajectory[-1], delta_ll_traj[-1]
     log_likelihood = delta_ll + get_prior_likelihood(prior, sigma=sigmas.max().item())
