@@ -25,12 +25,14 @@ import tqdm
 import tempfile
 from PIL import Image
 
+from ddpo_pytorch.diffusers_patch.likelihood import ode_likelihood
+
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 
 FLAGS = flags.FLAGS
-config_flags.DEFINE_config_file("config", "config/explore.py", "Training configuration.")
+config_flags.DEFINE_config_file("config", "config/explore2.py", "Training configuration.")
 
 logger = get_logger(__name__)
 
@@ -455,6 +457,18 @@ def main(_):
 
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
+            ## In case of deterministic sampling like DDIM, It is possible to pre-calculate the intrinsic reward
+            marginal_ll, bpd, nfe, trajectory, delta_ll_traj = ode_likelihood(
+                pipeline, 
+                latent=samples["latents"][:, -1], 
+                timestep=1,
+                prompt_embeds=samples["prompt_embeds"], ##TODO FIX
+            )
+            c = config.explore.decay
+            n = (epoch + 1) * total_train_batch_size
+            intrinsic_reward = torch.sqrt(torch.exp((delta_ll_traj - delta_ll_traj.detach()) * (c / np.sqrt(n))) - 1)[1: -1].transpose(0, 1)
+            
+            breakpoint()
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=accelerator.device)
             samples = {k: v[perm] for k, v in samples.items()}
@@ -482,7 +496,8 @@ def main(_):
             samples_batched = [
                 dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
             ]
-
+            
+            
             # train
             pipeline.unet.train()
             info = defaultdict(list)
@@ -499,9 +514,14 @@ def main(_):
                     )
                 else:
                     embeds = sample["prompt_embeds"]
-                    
-                    
                 accumulated_log_prob = 0 
+                
+                # ############## INTRINSIC REWARD SIMULATION ##############
+                # marginal_ll, bpd, nfe = ode_likelihood(pipeline, 
+                #     latent=sample["latents"][:, j], 
+                #     timestep=sample["timesteps"][:, j].item(),
+                #     prompt_embeds=embeds,
+                # )
                 
                 
                 for j in tqdm(
@@ -543,14 +563,15 @@ def main(_):
                             )
                         
                         
-                        ####### EXPLORATION VIA DENSITY #########
-                        accumulated_log_prob += log_prob
-                        accumulated_old_log_prob = sample["log_probs"][:, :j+1].sum(1)
-                        explore_sum_ratio = torch.exp(accumulated_log_prob - accumulated_old_log_prob)
-                        exponentiated_ratio = torch.pow(explore_sum_ratio, config.explore.decay / np.sqrt((float(global_step) + 1.0) * total_train_batch_size))
-                        intrinsic_reward = config.explore.beta * (torch.sqrt(torch.clamp(exponentiated_ratio, min=1.0) - 1))
-                        accelerator.backward(-intrinsic_reward, retain_graph=True)
-
+                            # ####### EXPLORATION VIA DENSITY #########
+                            # marginal_ll, bpd, nfe = ode_likelihood(pipeline, 
+                            #     latent=sample["latents"][:, j], 
+                            #     timestep=sample["timesteps"][:, j].item(),
+                            #     prompt_embeds=embeds,
+                            # ) ##TODO embed is not needed
+                        
+                        # intrinsic_reward = torch.sqrt(torch.exp((marginal_ll - marginal_ll.detach()) * (c / np.sqrt(n))) - 1)
+                        
                         # ppo logic
                         advantages = torch.clamp(
                             sample["advantages"],
@@ -564,10 +585,10 @@ def main(_):
                             1.0 - config.train.clip_range,
                             1.0 + config.train.clip_range,
                         )
-                        loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) 
+                        loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) - config.explore.beta * intrinsic_reward
                         
                         
-
+                        
                         # debugging values
                         # John Schulman says that (ratio - 1) - log(ratio) is a better
                         # estimator, but most existing code uses this so...

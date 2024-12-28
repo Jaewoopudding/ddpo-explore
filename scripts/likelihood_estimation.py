@@ -487,6 +487,27 @@ def main(_):
             )
             assert num_timesteps == config.sample.num_steps
 
+        total_batch_size, num_timesteps = samples["timesteps"].shape
+        assert (
+            total_batch_size
+            == config.sample.batch_size * config.sample.num_batches_per_epoch
+        )
+        assert num_timesteps == config.sample.num_steps
+        sample_data = samples['latents'][0, :]
+        sample_embed_prompts = samples['prompt_embeds'][:2, :, :]
+        
+        
+        from ddpo_pytorch.diffusers_patch.likelihood import ode_likelihood
+        
+        
+        result = ode_likelihood(pipeline, images, prompt_embeds=samples['prompt_embeds'][:1, :, :])
+        
+        breakpoint()
+        # #################### TRAINING ####################
+        # for inner_epoch in range(config.train.num_inner_epochs):
+        #     # shuffle samples along batch dimension
+        #     perm = torch.randperm(total_batch_size, device=accelerator.device)
+        #     samples = {k: v[perm] for k, v in samples.items()}
 
             breakpoint()
             sample_data = samples['latents'][0, :]
