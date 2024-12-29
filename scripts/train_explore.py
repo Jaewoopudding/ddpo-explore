@@ -466,16 +466,16 @@ def main(_):
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
             ## In case of deterministic sampling like DDIM, It is possible to pre-calculate the intrinsic reward
-            # marginal_ll, bpd, nfe, trajectory, delta_ll_traj = ode_likelihood(
-            #     pipeline, 
-            #     latent=samples["latents"][:, -1], 
-            #     timestep=1,
-            #     prompt_embeds=samples["prompt_embeds"], ##TODO FIX
-            # )
-            # c = config.explore.decay
-            # n = (epoch + 1) * total_train_batch_size
-            # intrinsic_rewards = torch.sqrt(torch.exp((delta_ll_traj - delta_ll_traj.detach()) * (c / np.sqrt(n))) - 1)[1: -1].transpose(0, 1)
-            # samples['intrinsic_rewards'] = intrinsic_rewards.flip(1)
+            marginal_ll, bpd, nfe, trajectory, delta_ll_traj = ode_likelihood(
+                pipeline, 
+                latent=samples["latents"][:, -1], 
+                timestep=1,
+                prompt_embeds=samples["prompt_embeds"], ##TODO FIX
+            )
+            c = config.explore.decay
+            n = (epoch + 1) * total_train_batch_size
+            intrinsic_rewards = config.explore.beta * torch.sqrt(torch.exp((marginal_ll - marginal_ll.detach()) * (c / np.sqrt(n))) - 1)
+
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=accelerator.device)
             samples = {k: v[perm] for k, v in samples.items()}
@@ -540,6 +540,15 @@ def main(_):
                 ):
                     with accelerator.accumulate(unet):
                         with autocast():
+                            if j == 0:
+                                intrinsic_loss = - intrinsic_rewards
+                                accelerator.backward(intrinsic_loss)
+                                if accelerator.sync_gradients:
+                                    accelerator.clip_grad_norm_(
+                                        unet.parameters(), config.train.max_grad_norm
+                                    )
+                                intrinsic_reward_optimizer.step()
+                                intrinsic_reward_optimizer.zero_grad()
                             
                             if config.train.cfg:
                                 noise_pred = unet(
@@ -623,27 +632,28 @@ def main(_):
                         optimizer.step()
                         optimizer.zero_grad()
 
-                        with autocast():
-                            marginal_ll, bpd, nfe, trajectory, delta_ll_traj = ode_likelihood(
-                                pipeline, 
-                                latent=samples["latents"][:, j], 
-                                timestep=1,
-                                prompt_embeds=embeds[:1], ##TODO FIX
-                            )
-                        c = config.explore.decay
-                        n = (epoch + 1) * total_train_batch_size
-                        intrinsic_rewards = torch.sqrt(torch.exp((marginal_ll - marginal_ll.detach()) * (c / np.sqrt(n))) - 1)
-                        intrinsic_loss = - config.explore.beta * intrinsic_rewards
+                        # with autocast():
+                        #     marginal_ll, bpd, nfe, trajectory, delta_ll_traj = ode_likelihood(
+                        #         pipeline, 
+                        #         latent=samples["latents"][:, j], 
+                        #         timestep=1,
+                        #         prompt_embeds=embeds[:1], ##TODO FIX
+                        #     )
+                        #     breakpoint()
+                        # c = config.explore.decay
+                        # n = (epoch + 1) * total_train_batch_size
+                        # intrinsic_rewards = torch.sqrt(torch.exp((marginal_ll - marginal_ll.detach()) * (c / np.sqrt(n))) - 1)
+                        # intrinsic_loss = - config.explore.beta * intrinsic_rewards
                         
-                        info["intrinsic rewards"].append(intrinsic_rewards)
+                        # info["intrinsic rewards"].append(intrinsic_rewards)
                         
-                        accelerator.backward(intrinsic_loss)
-                        if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(
-                                unet.parameters(), config.train.max_grad_norm
-                            )
-                        intrinsic_reward_optimizer.step()
-                        intrinsic_reward_optimizer.zero_grad()
+                        # accelerator.backward(intrinsic_loss)
+                        # if accelerator.sync_gradients:
+                        #     accelerator.clip_grad_norm_(
+                        #         unet.parameters(), config.train.max_grad_norm
+                        #     )
+                        # intrinsic_reward_optimizer.step()
+                        # intrinsic_reward_optimizer.zero_grad()
                         
                         
                     # Checks if the accelerator has performed an optimization step behind the scenes
