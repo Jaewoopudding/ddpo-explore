@@ -140,7 +140,7 @@ def ode_likelihood(
         return t[0]
                 
     class ODEFunc(nn.Module):
-        def __init__(self, pipeline, prompt_embeds, device, verbose=True):
+        def __init__(self, pipeline, prompt_embeds, device, verbose=False):
             super().__init__()
             self.pipeline = pipeline
             self.prompt_embeds = prompt_embeds.requires_grad_(True)
