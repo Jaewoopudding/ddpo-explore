@@ -45,7 +45,7 @@ def ode_likelihood(
     cross_attention_kwargs: Optional[Dict[str, Any]] = None,
     guidance_rescale: float = 0.0,
     num_inference_steps: int = 50,
-    solver: str = "dopri5",
+    solver: str = "euler",
     atol: float = 5e-2,
     rtol: float = 5e-2,
 ):
@@ -140,7 +140,7 @@ def ode_likelihood(
         return t[0]
                 
     class ODEFunc(nn.Module):
-        def __init__(self, pipeline, prompt_embeds, device, verbose=False):
+        def __init__(self, pipeline, prompt_embeds, device, verbose=True):
             super().__init__()
             self.pipeline = pipeline
             self.prompt_embeds = prompt_embeds.requires_grad_(True)
@@ -209,7 +209,6 @@ def ode_likelihood(
         atol=atol,
         rtol=rtol,
     )
-    breakpoint()
     trajectory, delta_ll_traj = result[0], result[1]
     prior, delta_ll= trajectory[-1], delta_ll_traj[-1]
     log_likelihood = delta_ll + get_prior_likelihood(prior, sigma=sigmas.max().item())
