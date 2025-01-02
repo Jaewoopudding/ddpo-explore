@@ -322,18 +322,18 @@ def main(_):
             range(FLAGS.epoch_from, FLAGS.epoch_to),            # position=0,
         ):
             
-            # latents = []
-            # images = []
+            latents = []
+            images = []
         
-            # for device in range(4):
-            #     latent = torch.load(f"{config.sample_path}/latents_epoch_{epoch}_cuda:{device}.pt", map_location=accelerator.device)
-            #     image = torch.load(f"{config.sample_path}/images_epoch_{epoch}_cuda:{device}.pt", map_location=accelerator.device)
-            #     latents.append(latent)
-            #     images += image
-            # samples = {k: torch.cat([l[k].cpu() for l in latents]) for k in samples.keys()}
+            for device in range(4):
+                latent = torch.load(f"{config.sample_path}/{config.reward_fn}/latents_epoch_{epoch}_cuda:0.pt", map_location=accelerator.device)
+                image = torch.load(f"{config.sample_path}/{config.reward_fn}/images_epoch_{epoch}_cuda:0.pt", map_location=accelerator.device)
+                latents.append(latent)
+                images += image
+            samples = {k: torch.cat([l[k].cpu() for l in latents]) for k in latent.keys()}
             
-            samples = torch.load(f"{config.sample_path}/latents_epoch_{epoch}_cuda:0.pt", map_location=accelerator.device)
-            image = torch.load(f"{config.sample_path}/images_epoch_{epoch}_cuda:0.pt", map_location=accelerator.device)
+            # samples = torch.load(f"{config.sample_path}/{config.reward_fn}/latents_epoch_{epoch}_cuda:0.pt", map_location=accelerator.device)
+            # image = torch.load(f"{config.sample_path}/{config.reward_fn}/images_epoch_{epoch}_cuda:0.pt", map_location=accelerator.device)
         
             samples = {k: samples[k][:FLAGS.num_sample_per_epoch].cpu() for k in samples.keys()}
             images = image[:FLAGS.num_sample_per_epoch]
@@ -356,29 +356,37 @@ def main(_):
             bpds = []
             log_likelihoods = []
             nfes = []
+            delta_lls = []
+            prior_likelihoods = []
             for idx in range(len(images)):
                 img = images[idx].to(pipeline.unet.device, dtype=inference_dtype)
                 prmpt = samples['prompt_embeds'][idx, None, :, :].to(pipeline.unet.device, dtype=inference_dtype)
-                log_likelihood, bpd, nfe, trajectory, delta_ll_traj = ode_likelihood(pipeline, img, prompt_embeds=prmpt, solver=FLAGS.solver, atol=FLAGS.atol, rtol=FLAGS.rtol)
+                log_likelihood, bpd, nfe, trajectory, delta_ll_traj, delta_ll, prior_likelihood, sigma_max = ode_likelihood(pipeline, img, prompt_embeds=prmpt, solver=FLAGS.solver, atol=FLAGS.atol, rtol=FLAGS.rtol)
                 print(f"Log likelihood: {log_likelihood}")
                 print(f"BPD: {bpd}")
                 print(f"NFE: {nfe}")
                 bpds.append(bpd.item())
                 log_likelihoods.append(log_likelihood.item())
                 nfes.append(nfe)
+                delta_lls.append(delta_ll.cpu().item())
+                prior_likelihoods.append(prior_likelihood.cpu().item())
+                
                 # print(f"delta_ll_traj: {delta_ll_traj}")
-            
+            oodscore = [oods.mean() for oods in samples["OOD_score"]]
             accelerator.log({
                 "epoch": epoch,
                 "bpd": np.mean(bpds),
                 "log_likelihood": np.mean(log_likelihoods),
                 "nfe": np.mean(nfes),
+                "delta_ll": np.mean(delta_lls),
+                "prior_likelihood": np.mean(prior_likelihoods),
+                "OOD_score": np.mean(oodscore),
                 # "delta_ll_traj": delta_ll_traj.item()
             })
             
 
             with open(file_path, "a") as file:
-                file.write(f"epoch: {epoch}, mean_bpd: {np.mean(bpds)}, mean_log_likelihood: {np.mean(log_likelihoods)}, mean_nfe: {np.mean(nfes)}, std_bpd: {np.std(bpds)}, std_log_likelihood: {np.std(log_likelihoods)}, std_nfe: {np.std(nfes)}\n")
+                file.write(f"epoch: {epoch}, mean_bpd: {np.mean(bpds)}, mean_log_likelihood: {np.mean(log_likelihoods)}, mean_nfe: {np.mean(nfes)}, mean_delta_ll: {np.mean(delta_lls)}, mean_prior_likelihood: {np.mean(prior_likelihoods)}, std_bpd: {np.std(bpds)}, std_log_likelihood: {np.std(log_likelihoods)}, std_nfe: {np.std(nfes)}, std_delta_ll: {np.std(delta_lls)}, std_prior_likelihood: {np.std(prior_likelihoods)}\n")
         # result = ode_likelihood(pipeline, images, prompt_embeds=samples['prompt_embeds'][:1, :, :])
         
         
@@ -418,7 +426,7 @@ def main(_):
 
                 # sample
                 with autocast():
-                    images, _, latents, log_probs = pipeline_with_logprob(
+                    images, _, latents, log_probs, noise_preds = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         negative_prompt_embeds=sample_neg_prompt_embeds,
