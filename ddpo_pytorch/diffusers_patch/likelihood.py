@@ -49,7 +49,7 @@ def ode_likelihood(
     cross_attention_kwargs: Optional[Dict[str, Any]] = None,
     guidance_rescale: float = 0.0,
     num_inference_steps: int = 50,
-    solver: str = "dopri5",
+    solver: str = "euler",
     atol: float = 5e-2,
     rtol: float = 5e-2,
 ):
@@ -217,6 +217,7 @@ def ode_likelihood(
         atol=atol,
         rtol=rtol,
     )
+<<<<<<< HEAD
     # breakpoint()
     trajectory, delta_ll_traj = result[0], result[1] # trajectory: (50, 1, 4, 64, 64), delta_ll_traj: (50, 1)
     prior, delta_ll= trajectory[-1].unsqueeze(0), delta_ll_traj[-1]
@@ -256,7 +257,7 @@ def ode_likelihood(
     # img = image_decode(pipeline, result[0][-1])
     # plt.imsave("randn_sigma_decoding.png", img[0])
     
-    return log_likelihood, bpd, ode_func.nfe, trajectory, delta_ll_traj, delta_ll, prior_likelihood, sigma_max
+    return log_likelihood, bpd, nfe, trajectory, delta_ll_traj, delta_ll, prior_likelihood, sigma_max
     
 def image_decode(pipeline, latents):
     image = pipeline.vae.decode(
