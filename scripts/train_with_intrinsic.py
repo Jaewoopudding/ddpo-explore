@@ -386,14 +386,16 @@ def main(_):
             time.sleep(0)
 
             
-
-            all_noise_preds = torch.stack(all_noise_preds)
+            all_noise_preds = torch.stack(all_noise_preds) / 10 # 10 is for scale
             l2_norms_squared = torch.norm(all_noise_preds, p=2, dim=(1, 2, 3, 4)) ** 2
-            cumsum_l2_norms_squared = torch.cumsum(l2_norms_squared, dim=1)
-            ood_score = torch.sqrt(cumsum_l2_norms_squared)
+            cumsum_l2_norms_squared = torch.cumsum(l2_norms_squared, dim=0)
+            ood_score = torch.sqrt(cumsum_l2_norms_squared).detach().to(accelerator.device)
 
+            assert not torch.isnan(l2_norms_squared).any()
+            assert not torch.isinf(l2_norms_squared).any()
+            assert round(ood_score[-1].cpu().item(), 4) == round(torch.sqrt(torch.sum(l2_norms_squared)).item(), 4)
 
-
+            # breakpoint()
             temp = {
                     "prompt_ids": prompt_ids,
                     "prompt_embeds": prompt_embeds,
@@ -406,7 +408,7 @@ def main(_):
                     ],  # each entry is the latent after timestep t
                     "log_probs": log_probs,
                     "rewards": rewards,
-                    "OOD_score": ood_score
+                    "ood_score": ood_score
                 }
 
             if config.rnd_ir.use_rnd:
@@ -538,7 +540,7 @@ def main(_):
         )
 
 
-        if config.rnd_ir.use_rnd or config.ll_ir.use_ll:
+        if config.rnd_ir.use_rnd or config.ll_ir.use_ll or config.ood_ir.use_ood:
             # stretch reward to shape of intrinsic reward
             temporal_reward = np.zeros_like(samples["intrinsic_rewards"].cpu().numpy())
 
@@ -701,6 +703,7 @@ def main(_):
                             )
                         )
                         
+                        info["ood_score"].append(sample["ood_score"][-1].float())
                         # try:
                         #     assert ratio.detach().cpu().numpy() == 1.0
                         # except:
