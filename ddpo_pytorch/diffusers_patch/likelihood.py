@@ -14,14 +14,18 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
 # reference: Yang Song's SDE tutorial jupyter notebook
 # https://colab.research.google.com/drive/120kYYBOVa1i0TD85RjlEkFjaWDxSFUx3#scrollTo=DfOkg5jBZcjF
 
+
 def get_prior_likelihood(
     z: torch.FloatTensor, 
     sigma: float,
 ):
-    shape = torch.tensor(z.shape)
-    N = torch.prod(shape[1:])
-    return -N / 2. * np.log(2*np.pi*sigma**2) - torch.sum(z**2, dim=(1,2,3)) / (2 * sigma**2)
     
+    shape = torch.tensor(z.shape)
+    N = torch.prod(shape[2:])
+    return -N / 2. * np.log(2*np.pi*sigma**2) - torch.sum(z**2, dim=(2,3,4)) / (2 * sigma**2)
+    
+
+
 def ode_likelihood(
     pipeline,
     x: Optional[torch.FloatTensor] = None,
@@ -120,7 +124,8 @@ def ode_likelihood(
         sampled_sigmas = torch.cat([torch.tensor([1e-6]).to(device), sampled_sigmas])
         
     epsilon = torch.randint_like(encoded_latents[0], 2) * 2 - 1
-    
+    assert sigmas != None
+    assert not torch.isnan(sigmas).any()
     # timestep 1 들어오면 이미지 들어온거임 -> 50번 ode sample해야 함. 
     # timestep 1000 들어오면 노이즈 들어온거임
     def sigma_to_t(sigma):
@@ -180,6 +185,7 @@ def ode_likelihood(
             return drift, divergence
             
         def forward(self, sigma, x):
+            assert sigmas != None
             self.nfe = self.nfe + 1
             with torch.enable_grad():
                 drift, divergence = self.estimate_drift_and_divergence(sigma, x)
@@ -197,6 +203,8 @@ def ode_likelihood(
     ode_func = ODEFunc(pipeline, prompt_embeds, device)
     sigma_max = sigmas.max()
     sigma_min = sigmas[timestep - 1]
+    assert sigmas != None
+    assert not torch.isnan(sigmas).any()
     result = odeint(
         ode_func, 
         (encoded_latents.requires_grad_(), torch.zeros(encoded_latents.shape[0]).to(device).requires_grad_()),  #encoded image and the zero likelihood
@@ -209,10 +217,11 @@ def ode_likelihood(
         atol=atol,
         rtol=rtol,
     )
-    breakpoint()
-    trajectory, delta_ll_traj = result[0], result[1]
-    prior, delta_ll= trajectory[-1], delta_ll_traj[-1]
-    log_likelihood = delta_ll + get_prior_likelihood(prior, sigma=sigmas.max().item())
+    # breakpoint()
+    trajectory, delta_ll_traj = result[0], result[1] # trajectory: (50, 1, 4, 64, 64), delta_ll_traj: (50, 1)
+    prior, delta_ll= trajectory[-1].unsqueeze(0), delta_ll_traj[-1]
+    prior_likelihood = get_prior_likelihood(prior, sigma=sigmas.max().item()).squeeze()
+    log_likelihood = delta_ll + prior_likelihood
     bpd = log_likelihood / 4 / 64 / 64 / np.log(2)
     
     # latents = torch.randn_like(encoded_latents).to(device)
