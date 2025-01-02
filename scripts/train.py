@@ -334,7 +334,7 @@ def main(_):
 
             # sample
             with autocast():
-                images, _, latents, log_probs = pipeline_with_logprob(
+                images, _, latents, log_probs, noise_preds = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=sample_neg_prompt_embeds,

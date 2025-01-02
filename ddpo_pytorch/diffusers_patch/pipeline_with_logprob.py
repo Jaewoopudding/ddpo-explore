@@ -181,6 +181,7 @@ def pipeline_with_logprob(
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
     all_latents = [latents]
     all_log_probs = []
+    all_noise_preds = []
     with self.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
             # expand the latents if we are doing classifier free guidance
@@ -218,6 +219,8 @@ def pipeline_with_logprob(
 
             all_latents.append(latents)
             all_log_probs.append(log_prob)
+            all_noise_preds.append(noise_pred.detach().cpu())
+
 
             # call the callback, if provided
             if i == len(timesteps) - 1 or (
@@ -251,4 +254,5 @@ def pipeline_with_logprob(
     if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
         self.final_offload_hook.offload()
 
-    return image, has_nsfw_concept, all_latents, all_log_probs
+    # print(all_noise_preds)
+    return image, has_nsfw_concept, all_latents, all_log_probs, all_noise_preds
