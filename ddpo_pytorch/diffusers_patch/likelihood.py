@@ -217,7 +217,7 @@ def ode_likelihood(
         atol=atol,
         rtol=rtol,
     )
-<<<<<<< HEAD
+    
     # breakpoint()
     trajectory, delta_ll_traj = result[0], result[1] # trajectory: (50, 1, 4, 64, 64), delta_ll_traj: (50, 1)
     prior, delta_ll= trajectory[-1].unsqueeze(0), delta_ll_traj[-1]
