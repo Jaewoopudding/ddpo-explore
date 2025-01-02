@@ -256,7 +256,7 @@ def ode_likelihood(
     # img = image_decode(pipeline, result[0][-1])
     # plt.imsave("randn_sigma_decoding.png", img[0])
     
-    return log_likelihood, bpd, ode_func.nfe, trajectory, delta_ll_traj
+    return log_likelihood, bpd, ode_func.nfe, trajectory, delta_ll_traj, delta_ll, prior_likelihood, sigma_max
     
 def image_decode(pipeline, latents):
     image = pipeline.vae.decode(
