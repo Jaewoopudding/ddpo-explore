@@ -413,8 +413,8 @@ def main(_):
 
             if config.rnd_ir.use_rnd:
                 ir = rnd.compute_intrinsic_reward(latents[:,1:].squeeze(0)).detach()
-                temp["intrinsic_rewards"] = ir
-
+                temp["intrinsic_rewards"] = ir.reshape(config.sample.batch_size, -1)
+                
             if config.ll_ir.use_ll:
 
 
@@ -429,7 +429,6 @@ def main(_):
                 ll = torch.exp(ll)
                 # TODO: Make this to shape (50,)
                 
-                breakpoint()
                 ### TODO: issue: 앞의 few timestep들은 prior likelihood가 delta_ll보다 커서 음수가 나오고, 이에 따라 ll이 음수가 나옴
                 temp["intrinsic_rewards"] = config.ll_ir.beta / ll.squeeze().detach().sqrt()
 
@@ -461,18 +460,12 @@ def main(_):
             sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
-        
         if config.rnd_ir.use_rnd or config.ll_ir.use_ll or config.ood_ir.use_ood:
-            irs = torch.tensor([sample["intrinsic_rewards"][-1] for sample in samples])
+            irs = torch.tensor([sample["intrinsic_rewards"].sum().cpu().item() for sample in samples])
         else:
             irs = torch.zeros_like(rewards)
-
-
-
+        
         samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
-
-
-
 
         # this is a hack to force wandb to log the images as JPEGs instead of PNGs
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -518,7 +511,6 @@ def main(_):
             step=global_step,
         )
 
-
             # reward의 shape (2,) 인데 irs는 모든 latent에 대해 있어서 (10,)
 
         # per-prompt mean/std tracking
@@ -539,34 +531,36 @@ def main(_):
             .reshape(accelerator.num_processes, -1)[accelerator.process_index]
             .to(accelerator.device)
         )
-
-
+        
         if config.rnd_ir.use_rnd or config.ll_ir.use_ll or config.ood_ir.use_ood:
-            # stretch reward to shape of intrinsic reward
-            temporal_reward = np.zeros_like(samples["intrinsic_rewards"].cpu().numpy())
+            samples['intrinsic_rewards'] = samples['intrinsic_rewards'].sum(1)
+            assert not torch.isnan(samples['intrinsic_rewards']).any()
+            print(1)
 
-            for ri in range(config.sample.num_batches_per_epoch):
-                last_step = config.sample.num_steps*(ri+1)-1
-                # put last step reward
-                temporal_reward[last_step] = samples["advantages"][ri]
+        # if config.rnd_ir.use_rnd or config.ll_ir.use_ll or config.ood_ir.use_ood:
+        #     # stretch reward to shape of intrinsic reward
+        #     temporal_reward = np.zeros_like(samples["intrinsic_rewards"].cpu().numpy())
+        #     for ri in range(config.sample.num_batches_per_epoch):
+        #         last_step = config.sample.num_steps*(ri+1)-1
+        #         # put last step reward
+        #         temporal_reward[last_step] = samples["advantages"][ri]
 
-                if config.rnd_ir.add_to_last_state:
-                    # sum intrinsic reward
-                    intrinsic_sum = samples["intrinsic_rewards"][:last_step].sum()
-                    temporal_reward[last_step] += intrinsic_sum
+        #         if config.rnd_ir.add_to_last_state:
+        #             # sum intrinsic reward
+        #             intrinsic_sum = samples["intrinsic_rewards"][:last_step].sum()
+        #             temporal_reward[last_step] += intrinsic_sum
 
-            # put all intrinsic rewards
-            temporal_reward = torch.tensor(temporal_reward, device=accelerator.device, dtype=torch.float32)
-            temporal_reward += samples["intrinsic_rewards"]
+        #     # put all intrinsic rewards
+        #     temporal_reward = torch.tensor(temporal_reward, device=accelerator.device, dtype=torch.float32)
+        #     temporal_reward += samples["intrinsic_rewards"]
+        #     samples["advantages"] = temporal_reward.reshape(config.sample.num_batches_per_epoch, -1)
             
-            samples["advantages"] = temporal_reward.reshape(config.sample.num_batches_per_epoch, -1)
-            
-        assert not torch.isnan(samples["advantages"]).any()
+        # assert not torch.isnan(samples["advantages"]).any()
 
         del samples["rewards"]
         del samples["prompt_ids"]
-        if config.rnd_ir.use_rnd:
-            del samples["intrinsic_rewards"]
+        # if config.rnd_ir.use_rnd:
+        #     del samples["intrinsic_rewards"]
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
         assert (
@@ -662,18 +656,18 @@ def main(_):
                             )
 
                         # ppo logic
-                        if config.use_intrinsic_reward:
-                            advantages = torch.clamp(
-                                sample["advantages"][:,j],
-                                -config.train.adv_clip_max,
-                                config.train.adv_clip_max,
-                            )
-                        else:
-                            advantages = torch.clamp(
-                                sample["advantages"],
-                                -config.train.adv_clip_max,
-                                config.train.adv_clip_max,
-                            )
+                        # if config.use_intrinsic_reward:
+                        #     advantages = torch.clamp(
+                        #         sample["advantages"][:,j],
+                        #         -config.train.adv_clip_max,
+                        #         config.train.adv_clip_max,
+                        #     )
+                        # else:
+                        advantages = torch.clamp(
+                            sample["advantages"] + sample['intrinsic_rewards'] if (config.rnd_ir.use_rnd or config.ll_ir.use_ll or config.ood_ir.use_ood) else sample["advantages"],
+                            -config.train.adv_clip_max,
+                            config.train.adv_clip_max,
+                        )
 
                         ratio = torch.exp(log_prob - sample["log_probs"][:, j])
                         unclipped_loss = -advantages * ratio
