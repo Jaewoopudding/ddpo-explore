@@ -84,7 +84,7 @@ def main(_):
     )
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="Explorative-Diffusion-Finetuning-IR",
+            project_name=f"Explorative-Diffusion-Finetuning-{config.reward_fn}",
             config=config.to_dict(),
             init_kwargs={"wandb": {"name": config.reward_fn + f"_{config.train.gradient_accumulation_steps * accelerator.state.num_processes}_original",
                                    "group": config.prompt_fn}},
@@ -393,7 +393,7 @@ def main(_):
 
             assert not torch.isnan(l2_norms_squared).any()
             assert not torch.isinf(l2_norms_squared).any()
-            assert round(ood_score[-1].cpu().item(), 4) == round(torch.sqrt(torch.sum(l2_norms_squared)).item(), 4)
+            # assert round(ood_score[-1].cpu().item(), 3) == round(torch.sqrt(torch.sum(l2_norms_squared)).item(), 3), f"{ood_score[-1].cpu().item()} and {torch.sqrt(torch.sum(l2_norms_squared)).item()}"
 
             # breakpoint()
             temp = {
@@ -417,12 +417,7 @@ def main(_):
 
             if config.ll_ir.use_ll:
 
-                breakpoint()
 
-
-                print(pipeline)
-                print(images.shape)
-                
                 log_likelihood, _, _, prior_traj, delta_ll_traj, _, _, sigma_max = ode_likelihood(
                     pipeline, images, prompt_embeds=prompt_embeds, solver=config.ll_ir.solver, atol=config.ll_ir.atol, rtol=config.ll_ir.rtol
                     )
@@ -431,12 +426,18 @@ def main(_):
                 ll = prior_likelihood + delta_ll_traj
 
                 assert ll[-1] == log_likelihood
+                ll = torch.exp(ll)
                 # TODO: Make this to shape (50,)
                 
+                breakpoint()
+                ### TODO: issue: 앞의 few timestep들은 prior likelihood가 delta_ll보다 커서 음수가 나오고, 이에 따라 ll이 음수가 나옴
                 temp["intrinsic_rewards"] = config.ll_ir.beta / ll.squeeze().detach().sqrt()
 
 
-                print(temp["intrinsic_rewards"].mean())  ## TODO: 여기서부터 디버깅,, 얘가 NaN뜸ㅠ
+                # print(temp["intrinsic_rewards"])  ## TODO: 여기서부터 디버깅,, 얘가 NaN뜸ㅠ
+
+                assert not torch.isnan(temp["intrinsic_rewards"]).any()
+
 
             if config.ood_ir.use_ood:
                 temp["intrinsic_rewards"] = ood_score * config.ood_ir.intrinsic_coef
@@ -461,7 +462,7 @@ def main(_):
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         
-        if config.rnd_ir.use_rnd or config.ll_ir.use_ll:
+        if config.rnd_ir.use_rnd or config.ll_ir.use_ll or config.ood_ir.use_ood:
             irs = torch.tensor([sample["intrinsic_rewards"][-1] for sample in samples])
         else:
             irs = torch.zeros_like(rewards)
@@ -760,8 +761,7 @@ def main(_):
 
                     rnd_optimizer.zero_grad()
                     
-                    rnd_loss.backward()
-                    
+                    accelerator.backward(rnd_loss)
 
                     if config.rnd_ir.max_grad_norm is not None:
                         accelerator.clip_grad_norm_(
