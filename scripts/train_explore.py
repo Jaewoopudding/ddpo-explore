@@ -32,7 +32,7 @@ tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 
 FLAGS = flags.FLAGS
-config_flags.DEFINE_config_file("config", "config/explore2.py", "Training configuration.")
+config_flags.DEFINE_config_file("config", "config/explore_differentiable_likelihood.py", "Training configuration.")
 
 logger = get_logger(__name__)
 
@@ -345,7 +345,7 @@ def main(_):
 
             # sample
             with autocast():
-                images, _, latents, log_probs = pipeline_with_logprob(
+                images, _, latents, log_probs, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=sample_neg_prompt_embeds,
@@ -367,6 +367,16 @@ def main(_):
             rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
             # yield to to make sure reward computation starts
             time.sleep(0)
+            # marginal_ll, bpd, nfe, trajectory, delta_ll_traj, _, _, _ = ode_likelihood(
+            #                 pipeline, 
+            #                 latent=latents[:, -1], 
+            #                 timestep=1,
+            #                 prompt_embeds=prompt_embeds, ##TODO FIX
+            # )
+            
+            # c = config.explore.decay
+            # n = (epoch + 1) * total_train_batch_size
+            # intrinsic_rewards = config.explore.beta * torch.sqrt(torch.exp((marginal_ll - marginal_ll.detach()) * (c / np.sqrt(n))) - 1)
 
             samples.append(
                 {
@@ -381,6 +391,7 @@ def main(_):
                     ],  # each entry is the latent after timestep t
                     "log_probs": log_probs,
                     "rewards": rewards,
+                    # "intrinsic_rewards": intrinsic_rewards.reshape(config.sample.batch_size, -1)
                 }
             )
 
@@ -394,10 +405,8 @@ def main(_):
             rewards, reward_metadata = sample["rewards"].result()
             # accelerator.print(reward_metadata)
             sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
-
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
-
         # this is a hack to force wandb to log the images as JPEGs instead of PNGs
         with tempfile.TemporaryDirectory() as tmpdir:
             for i, image in enumerate(images):
@@ -466,15 +475,21 @@ def main(_):
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
             ## In case of deterministic sampling like DDIM, It is possible to pre-calculate the intrinsic reward
-            marginal_ll, bpd, nfe, trajectory, delta_ll_traj = ode_likelihood(
-                pipeline, 
-                latent=samples["latents"][:, -1], 
-                timestep=1,
-                prompt_embeds=samples["prompt_embeds"], ##TODO FIX
-            )
-            c = config.explore.decay
-            n = (epoch + 1) * total_train_batch_size
-            intrinsic_rewards = config.explore.beta * torch.sqrt(torch.exp((marginal_ll - marginal_ll.detach()) * (c / np.sqrt(n))) - 1)
+            # for sample in tqdm(
+            #     range(config.sample.num_batches_per_epoch),
+            #     desc=f"Epoch {epoch}: sampling",
+            #     disable=not accelerator.is_local_main_process,
+            #     position=0,
+            # ):
+            #     marginal_ll, bpd, nfe, trajectory, delta_ll_traj, _, _, _ = ode_likelihood(
+            #         pipeline, 
+            #         latent=samples["latents"][:, -1], 
+            #         timestep=1,
+            #         prompt_embeds=samples["prompt_embeds"], ##TODO FIX
+            #     )
+            #     c = config.explore.decay
+            #     n = (epoch + 1) * total_train_batch_size
+            #     intrinsic_rewards = config.explore.beta * torch.sqrt(torch.exp((marginal_ll - marginal_ll.detach()) * (c / np.sqrt(n))) - 1)
 
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=accelerator.device)
@@ -540,15 +555,40 @@ def main(_):
                 ):
                     with accelerator.accumulate(unet):
                         with autocast():
+                            # if j == 0:
+                            #     intrinsic_loss = - intrinsic_rewards
+                            #     accelerator.backward(intrinsic_loss)
+                            #     if accelerator.sync_gradients:
+                            #         accelerator.clip_grad_norm_(
+                            #             unet.parameters(), config.train.max_grad_norm
+                            #         )
+                            #     intrinsic_reward_optimizer.step()
+                            #     intrinsic_reward_optimizer.zero_grad()
                             if j == 0:
-                                intrinsic_loss = - intrinsic_rewards
-                                accelerator.backward(intrinsic_loss)
-                                if accelerator.sync_gradients:
-                                    accelerator.clip_grad_norm_(
-                                        unet.parameters(), config.train.max_grad_norm
-                                    )
-                                intrinsic_reward_optimizer.step()
-                                intrinsic_reward_optimizer.zero_grad()
+                                index_of_last_latent = torch.where(sample['timesteps'] == 1)[-1]
+                                marginal_ll, bpd, nfe, trajectory, delta_ll_traj, _, _, _ = ode_likelihood(
+                                                pipeline, 
+                                                latent=latents[:, index_of_last_latent].reshape(config.sample.batch_size, *latents.shape[2:]), 
+                                                timestep=1,
+                                                prompt_embeds=prompt_embeds, ##TODO FIX
+                                )
+                                assert not torch.isnan(marginal_ll).any()
+                                c = config.explore.decay
+                                n = (epoch + 1) * total_train_batch_size
+                                intrinsic_rewards = config.explore.beta * torch.sqrt(torch.exp((marginal_ll - marginal_ll.detach()) * (c / np.sqrt(n))) - 1)
+                                accelerator.backward(-intrinsic_rewards)
+                                
+                                # marginal_ll, bpd, nfe, trajectory, delta_ll_traj, _, _, _ = ode_likelihood(
+                                #                 pipeline, 
+                                #                 latent=latents[:, -1], 
+                                #                 timestep=1,
+                                #                 prompt_embeds=prompt_embeds, ##TODO FIX
+                                # )
+                                
+                                # c = config.explore.decay
+                                # n = (epoch + 1) * total_train_batch_size
+                                # intrinsic_rewards = config.explore.beta * torch.sqrt(torch.exp((marginal_ll - marginal_ll.detach()) * (c / np.sqrt(n))) - 1)
+                                # accelerator.backward(-intrinsic_rewards)
                             
                             if config.train.cfg:
                                 noise_pred = unet(
@@ -604,7 +644,6 @@ def main(_):
                         loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
                         
                         
-                        
                         # debugging values
                         # John Schulman says that (ratio - 1) - log(ratio) is a better
                         # estimator, but most existing code uses this so...
@@ -631,7 +670,8 @@ def main(_):
                             )
                         optimizer.step()
                         optimizer.zero_grad()
-
+                        intrinsic_reward_optimizer.step()
+                        intrinsic_reward_optimizer.zero_grad()
                         # with autocast():
                         #     marginal_ll, bpd, nfe, trajectory, delta_ll_traj = ode_likelihood(
                         #         pipeline, 
