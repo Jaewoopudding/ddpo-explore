@@ -745,7 +745,7 @@ def main(_):
     
                 if config.rnd_ir.use_rnd:
                     rnd.train()
-                    next_latents = copy.deepcopy(sample["next_latents"].squeeze(0))
+                    next_latents = copy.deepcopy(sample["next_latents"].squeeze(0)).detach().requires_grad_()
                     rnd_loss = rnd.compute_loss(next_latents)
                     rnd_loss *= config.rnd_ir.rnd_loss_weight
                         
